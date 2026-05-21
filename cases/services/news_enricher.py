@@ -871,6 +871,18 @@ class NewsEnricher:
             logger.exception("Failed to load URL-to-source map")
         return url_map
 
+    def _index_source_url(
+        self, urls: set[str], url_map: dict[str, str], source
+    ) -> None:
+        """Add source URL strings to the dedup set and URL→source_id map."""
+        if not isinstance(source.url, list):
+            return
+        for u in source.url:
+            if isinstance(u, str):
+                urls.add(u)
+                if u not in url_map:
+                    url_map[u] = source.source_id
+
     def _get_existing_url_metadata(self) -> tuple[set[str], dict[str, str]]:
         """Get existing article URLs and URL→source_id mapping in one pass."""
         urls = set()
@@ -879,12 +891,7 @@ class NewsEnricher:
             for source in DocumentSource.objects.filter(
                 source_type=SourceType.MEDIA_NEWS, is_deleted=False
             ).only("url", "source_id"):
-                if isinstance(source.url, list):
-                    for u in source.url:
-                        if isinstance(u, str):
-                            urls.add(u)
-                            if u not in url_map:
-                                url_map[u] = source.source_id
+                self._index_source_url(urls, url_map, source)
         except Exception:
             logger.exception("Failed to load existing URL metadata")
         return urls, url_map
@@ -1056,38 +1063,9 @@ Excerpt: {article_excerpt}"""
             return None
 
         source_by_id = {s.source_id: s for s in sources}
-        press_release_parts = []
-
-        for sid in source_ids:
-            source = source_by_id.get(sid)
-            if source is None:
-                continue
-            if not self._is_press_release_source(source):
-                continue
-
-            description = (source.description or "").strip()
-            if len(description) > 200:
-                press_release_parts.append(description)
-                logger.debug(
-                    "  Press release text from source %s: %d chars",
-                    source.source_id,
-                    len(description),
-                )
-            elif isinstance(source.url, list):
-                for url in source.url:
-                    if not self._is_pdf_url(url):
-                        continue
-                    parsed = urlparse(url)
-                    if parsed.hostname and parsed.hostname in _ALLOWED_HOSTS:
-                        content = self._convert_to_markdown(url)
-                        if content and len(content) > 200:
-                            press_release_parts.append(content)
-                            logger.debug(
-                                "  Press release text from URL %s: %d chars",
-                                url,
-                                len(content),
-                            )
-                            break
+        press_release_parts = self._collect_press_release_parts(
+            source_ids, source_by_id
+        )
 
         if not press_release_parts:
             logger.debug(
@@ -1121,6 +1099,23 @@ Excerpt: {article_excerpt}"""
             self._extract_text_from_source(source, parts)
         return parts
 
+    def _extract_pdf_from_source(self, source: DocumentSource) -> Optional[str]:
+        """Try to extract text from PDF URLs in an allowed-host source.
+        Returns the converted markdown content or None.
+        """
+        if not isinstance(source.url, list):
+            return None
+        for url in source.url:
+            if not self._is_pdf_url(url):
+                continue
+            parsed = urlparse(url)
+            if not parsed.hostname or parsed.hostname not in _ALLOWED_HOSTS:
+                continue
+            content = self._convert_to_markdown(url)
+            if content and len(content) > 200:
+                return content
+        return None
+
     def _extract_text_from_source(
         self, source: DocumentSource, parts: list[str]
     ) -> None:
@@ -1139,21 +1134,13 @@ Excerpt: {article_excerpt}"""
             )
             return
 
-        if isinstance(source.url, list):
-            for url in source.url:
-                if not self._is_pdf_url(url):
-                    continue
-                parsed = urlparse(url)
-                if parsed.hostname and parsed.hostname in _ALLOWED_HOSTS:
-                    content = self._convert_to_markdown(url)
-                    if content and len(content) > 200:
-                        parts.append(content)
-                        logger.debug(
-                            "  Press release text from URL %s: %d chars",
-                            url,
-                            len(content),
-                        )
-                        break
+        content = self._extract_pdf_from_source(source)
+        if content:
+            parts.append(content)
+            logger.debug(
+                "  Press release text from URL: %d chars",
+                len(content),
+            )
 
     @staticmethod
     def _is_pdf_url(url: str) -> bool:
