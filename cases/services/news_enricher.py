@@ -1,0 +1,1508 @@
+"""Service for searching and enriching CIAA cases with news articles."""
+
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+from datetime import date, datetime
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Optional
+from urllib.parse import quote_plus, urljoin, urlparse
+
+import requests
+from django.db import transaction
+
+from cases.models import Case, DocumentSource, SourceType
+
+logger = logging.getLogger(__name__)
+
+_MAX_HTML_REGEX_LENGTH = 500_000
+
+_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; JawafdehiAPI/1.0)",
+}
+_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; JawafdehiAPI/1.0)",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "en,ne;q=0.9",
+}
+
+
+def _truncate_for_regex(html: str) -> str:
+    """Truncate HTML to a safe length for regex operations."""
+    if len(html) > _MAX_HTML_REGEX_LENGTH:
+        return html[:_MAX_HTML_REGEX_LENGTH]
+    return html
+
+
+_ALLOWED_HOSTS = frozenset({"ciaa.gov.np", "ngm-store.jawafdehi.org"})
+
+_OFFICIAL_PRESS_RELEASE_PATTERNS = (
+    re.compile(r"^https?://(?:www\.)?ciaa\.gov\.np/pressrelease/", re.IGNORECASE),
+)
+
+_URL_BLOCKLIST_PATTERNS = (
+    re.compile(r"/tag[/?]|/category[/?]|/author[/?]|/page/\d+", re.IGNORECASE),
+)
+
+_NON_NEWS_DOMAIN_PATTERNS = (
+    re.compile(r"^https?://(?:[a-z-]+\.)?wikipedia\.org/", re.IGNORECASE),
+    re.compile(r"^https?://(?:[a-z-]+\.)?facebook\.com/", re.IGNORECASE),
+)
+
+_NEWS_DOMAIN_PATTERNS = (
+    "gorkhapatraonline",
+    "surakshyanews",
+    "ekantipur",
+    "onlinekhabar",
+    "setopati",
+    "ratopati",
+    "nagariknews",
+    "nepalnews",
+    "myrepublica",
+    "kathmandupost",
+    "himalayantimes",
+    "nepalkhabar",
+    "annapurnapost",
+    "nayapatrikadaily",
+    "ujyaaloonline",
+)
+
+
+def _is_official_press_release(url: str) -> bool:
+    """Check if a URL is an official CIAA press release page (not third-party news)."""
+    for pattern in _OFFICIAL_PRESS_RELEASE_PATTERNS:
+        if pattern.search(url):
+            return True
+    return False
+
+
+def _is_url_blocklisted(url: str) -> Optional[str]:
+    """Check if a URL matches a blocklist pattern. Returns reason string or None."""
+    for pattern in _URL_BLOCKLIST_PATTERNS:
+        if pattern.search(url):
+            return "tag/category/author page"
+    for pattern in _NON_NEWS_DOMAIN_PATTERNS:
+        if pattern.search(url):
+            return "non-news domain (wikipedia/facebook)"
+    return None
+
+
+_VERIFY_SYSTEM_PROMPT = """\
+You are a fact-checking assistant for a Nepal corruption accountability platform.
+Your job is to determine whether a given news article is genuinely about the same
+CIAA Special Court corruption case as the case described below.
+
+You must respond with ONLY a JSON object in one of these two formats:
+
+If the article IS about the same case:
+{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case."}
+
+If the article is NOT about the same case:
+{"relevant": false, "reason": "Brief explanation in English of why this article does not match."}
+
+Rules:
+- The article must reference the same corruption case, not just mention the same person in an unrelated context.
+- Matching on case number alone is strong evidence of relevance.
+- Matching on defendant name + corruption allegations is medium evidence.
+- If the article is about a different corruption case involving the same person, it is NOT relevant.
+- If the article is about the same person but not about corruption allegations, it is NOT relevant.
+"""
+
+
+class _TextExtractor(HTMLParser):
+    """Extract visible text from HTML, skipping script/style tags."""
+
+    def __init__(self):
+        super().__init__()
+        self.text_parts = []
+        self._skip = False
+        self._skip_tags = {"script", "style", "noscript", "nav", "footer", "header"}
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in self._skip_tags:
+            self._skip = True
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self._skip_tags:
+            self._skip = False
+        if tag.lower() in ("p", "br", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6"):
+            self.text_parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            text = data.strip()
+            if text:
+                self.text_parts.append(text)
+
+
+class _ImageExtractor(HTMLParser):
+    """Extract img tags from HTML."""
+
+    def __init__(self, base_url=""):
+        super().__init__()
+        self.base_url = base_url
+        self.images = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "img":
+            attrs_dict = dict(attrs)
+            src = attrs_dict.get("src", "")
+            alt = attrs_dict.get("alt", "") or attrs_dict.get("title", "")
+            if src:
+                full_url = urljoin(self.base_url, src)
+                self.images.append({"url": full_url, "alt": alt})
+
+
+def _extract_text_from_html(html: str) -> str:
+    """Extract visible text from HTML."""
+    parser = _TextExtractor()
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+    text = " ".join(parser.text_parts)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _extract_images_from_html(html: str, base_url: str = "") -> list[dict]:
+    """Extract image URLs from HTML."""
+    parser = _ImageExtractor(base_url=base_url)
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+    return parser.images
+
+
+def _extract_title_from_html(html: str) -> str:
+    """Extract title from HTML <title> tag."""
+    safe_html = _truncate_for_regex(html)
+    match = re.search(r"<title[^>]*>([^<]*)</title>", safe_html, re.IGNORECASE)
+    if match:
+        title = re.sub(r"\s+", " ", match.group(1)).strip()
+        return title
+    return ""
+
+
+def _search_duckduckgo(query: str, timeout: int = 15) -> list[dict]:
+    """Search DuckDuckGo HTML and return list of result dicts.
+
+    Returns list of dicts with keys: title, url, snippet.
+    """
+    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    try:
+        resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("DuckDuckGo search failed for query '%s': %s", query[:60], exc)
+        return []
+
+    html = _truncate_for_regex(resp.text)
+    results = []
+
+    link_pattern = re.compile(
+        r'<a[^>]{0,200}class="result__a"[^>]{0,100}href="([^"]{1,500})"[^>]{0,50}>'
+        r"([^<]{1,500})</a>",
+        re.IGNORECASE,
+    )
+    snippet_pattern = re.compile(
+        r'<a[^>]{0,200}class="result__snippet"[^>]{0,100}>([^<]{1,1000})</a>',
+        re.IGNORECASE,
+    )
+
+    links = link_pattern.findall(html)
+    snippets = snippet_pattern.findall(html)
+
+    for i, (href, title_html) in enumerate(links):
+        result_url = _extract_ddg_redirect(href)
+        title_text = re.sub(r"<[^>]+>", "", title_html).strip()
+        snippet_text = ""
+        if i < len(snippets):
+            snippet_text = re.sub(r"<[^>]+>", "", snippets[i]).strip()
+
+        if result_url and title_text:
+            results.append(
+                {"title": title_text, "url": result_url, "snippet": snippet_text}
+            )
+
+    return results
+
+
+def _extract_ddg_redirect(url: str) -> str:
+    """Extract the real URL from DuckDuckGo redirect URL."""
+    if "uddg=" in url:
+        from urllib.parse import parse_qs, unquote
+
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        uddg = params.get("uddg", [""])[0]
+        if uddg:
+            return unquote(uddg)
+    return url
+
+
+def _resolve_case_number(case: Case) -> Optional[str]:
+    """Extract the first court case number from case.court_cases."""
+    if not case.court_cases:
+        return None
+    for cc in case.court_cases:
+        if isinstance(cc, str) and ":" in cc:
+            return cc.split(":", 1)[1]
+    return None
+
+
+def _generate_query_variations(case: Case) -> list[str]:
+    """Generate search query variations for a CIAA case.
+
+    Prioritizes accused name + location + corruption keywords over case numbers,
+    which mostly surface court/admin pages rather than newsrooms.
+    """
+    case_number = _resolve_case_number(case)
+    title = case.title or ""
+
+    queries = _build_name_based_queries(case)
+    _append_title_keyword_query(queries, title)
+    _append_accused_corruption_queries(queries, case)
+    _append_location_queries(queries, case, title)
+
+    deduped = _deduplicate_queries(queries, case_number, _get_accused_names(case))
+    return deduped[:10]
+
+
+def _append_title_keyword_query(queries: list[str], title: str) -> None:
+    title_keywords = _extract_title_keywords(title)
+    if title_keywords:
+        queries.append(f"{title_keywords} भ्रष्टाचार")
+
+
+def _append_accused_corruption_queries(queries: list[str], case: Case) -> None:
+    key_allegations = case.key_allegations or []
+    corruption_keywords = _extract_corruption_keywords(key_allegations)
+    accused_names = _get_accused_names(case)
+
+    for name in accused_names[:2]:
+        name_clean = re.sub(r"\s+", " ", name).strip()
+        if not name_clean or len(name_clean) < 3:
+            continue
+        for kw in corruption_keywords[:2]:
+            queries.append(f"{name_clean} {kw} Nepal")
+
+
+def _append_location_queries(queries: list[str], case: Case, title: str) -> None:
+    accused_names = _get_accused_names(case)
+    if not accused_names:
+        return
+    name_clean = re.sub(r"\s+", " ", accused_names[0]).strip()
+    if not name_clean or len(name_clean) <= 3:
+        return
+    location = _extract_location_from_title(title)
+    if location:
+        queries.append(f"{name_clean} {location} भ्रष्टाचार")
+        queries.append(f"{name_clean} {location} अख्तियार")
+
+
+def _deduplicate_queries(
+    queries: list[str], case_number: Optional[str], accused_names: list[str]
+) -> list[str]:
+    seen = set()
+    deduped = []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            deduped.append(q)
+
+    if case_number:
+        name_clean = (
+            re.sub(r"\s+", " ", accused_names[0]).strip() if accused_names else ""
+        )
+        if name_clean and len(name_clean) > 3:
+            deduped.append(f'"{case_number}" {name_clean}')
+
+    return deduped
+
+
+def _build_name_based_queries(case: Case) -> list[str]:
+    """Build search queries from accused names and locations."""
+    queries = []
+    accused_names = _get_accused_names(case)
+    title = case.title or ""
+
+    location = _extract_location_from_title(title)
+
+    for name in accused_names[:3]:
+        name_clean = re.sub(r"\s+", " ", name).strip()
+        if not name_clean or len(name_clean) < 3:
+            continue
+        if location:
+            queries.append(f'"{name_clean}" {location} भ्रष्टाचार')
+            queries.append(f"{name_clean} {location} अख्तियार")
+        queries.append(f'"{name_clean}" भ्रष्टाचार')
+        queries.append(f'"{name_clean}" अख्तियार')
+        queries.append(f"{name_clean} CIAA corruption")
+
+    return queries
+
+
+def _extract_location_from_title(title: str) -> str:
+    """Extract a location name from case title."""
+    location_match = re.search(
+        r"(?:कार्यालय|नगरपालिका|गाउँपालिका|जिल्ला)\s+(\S{1,50})",
+        title,
+    )
+    if location_match:
+        return location_match.group(1)
+    loc_match2 = re.search(r"(\S{1,50})(?:को|का|मा)\s+(?:नापी|मालपोत|स्वास्थ्य)", title)
+    if loc_match2:
+        return loc_match2.group(1)
+    return ""
+
+
+def _extract_title_keywords(title: str) -> str:
+    """Extract meaningful keywords from case title for search."""
+    if not title:
+        return ""
+    parts = re.split(r"[,।\n]", title)
+    if len(parts) > 1 and len(parts[0].strip()) > 10:
+        return parts[0].strip()[:80]
+    cleaned = re.sub(r"\b(?:मुद्दा|विरुद्ध|सम्बन्धी|सम्बन्धमा|मा\.?)\b", "", title)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:100]
+
+
+def _get_accused_names(case: Case) -> list[str]:
+    """Extract accused entity names from a case."""
+    names = []
+    if case.title:
+        match = re.search(
+            r"(?:विरुद्ध|vs\.?|versus)\s+(.{1,200})(?:\s+मुद्दा|\s+मा\.?\s|$)",
+            case.title,
+        )
+        if match:
+            rest = match.group(1).strip()
+            if " र " in rest:
+                names.extend(n.strip() for n in rest.split(" र "))
+            elif "," in rest:
+                names.extend(n.strip() for n in rest.split(","))
+            else:
+                names.append(rest)
+
+    if not names and case.title:
+        names.append(case.title[:80])
+
+    return names[:5]
+
+
+def _extract_corruption_keywords(key_allegations: list[str]) -> list[str]:
+    """Extract corruption-related keywords from allegations for search queries."""
+    corruption_terms = [
+        "घुस",
+        "रिश्वत",
+        "भ्रष्टाचार",
+        "अवैध सम्पत्ति",
+        "हिनामिना",
+        "पद दुरुपयोग",
+        "किर्ते",
+        "नक्कली",
+        "बिगो",
+        "अख्तियार",
+        "विशेष अदालत",
+        "bribery",
+        "corruption",
+        "illegal property",
+        "embezzlement",
+        "forgery",
+        "abuse of authority",
+    ]
+    found = []
+    text = " ".join(key_allegations).lower()
+    for term in corruption_terms:
+        if term.lower() in text:
+            found.append(term)
+    return found[:3]
+
+
+def _fetch_article_content(url: str, timeout: int = 20) -> Optional[str]:
+    """Fetch article HTML content from URL.
+
+    Returns raw HTML string or None on failure.
+    """
+    try:
+        resp = requests.get(
+            url, headers=_FETCH_HEADERS, timeout=timeout, allow_redirects=True
+        )
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").lower()
+        if "text/html" not in content_type and "application/xhtml" not in content_type:
+            return None
+        return resp.text
+    except requests.RequestException as exc:
+        logger.debug("Failed to fetch %s: %s", url, exc)
+        return None
+
+
+def _detect_truncated_response(data: dict) -> bool:
+    """Check if the LLM response was truncated due to max_tokens limit."""
+    choices = data.get("choices", [])
+    if not choices:
+        return False
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    finish_reason = choice.get("finish_reason", "") if isinstance(choice, dict) else ""
+    return finish_reason == "length"
+
+
+def _resolve_llm_content(data: dict) -> Optional[str]:
+    """Safely extract content from LLM response, supporting OpenAI and alternate shapes."""
+    choices = data.get("choices", [])
+    if not choices:
+        return None
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message", {}) if isinstance(choice, dict) else {}
+    content = message.get("content") if isinstance(message, dict) else None
+    if content is not None:
+        return content
+    content = choice.get("text") if isinstance(choice, dict) else None
+    if content is not None:
+        return content
+    content = message.get("text") if isinstance(message, dict) else None
+    if content is not None:
+        return content
+    content = choice.get("content") if isinstance(choice, dict) else None
+    return content
+
+
+def _fallback_parse_relevance(raw_text: str) -> Optional[dict]:
+    """Try to extract relevance from raw response when JSON parse fails."""
+    match = re.search(r'"relevant"\s*:\s*(true|false)', raw_text)
+    if match:
+        is_relevant = match.group(1) == "true"
+        conf_match = re.search(r'"confidence"\s*:\s*"([^"]+)"', raw_text)
+        reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw_text)
+        return {
+            "relevant": is_relevant,
+            "confidence": conf_match.group(1) if conf_match else "low",
+            "reason": (
+                reason_match.group(1)
+                if reason_match
+                else "fallback: extracted from raw response"
+            ),
+        }
+    return None
+
+
+def _call_llm(
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+    timeout: int = 60,
+) -> Optional[dict]:
+    """Call LLM API and return parsed JSON response."""
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 800,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if _detect_truncated_response(data):
+            logger.warning(
+                "LLM response truncated (finish_reason=length) — "
+                "response may be incomplete; consider increasing max_tokens or reducing prompt size"
+            )
+
+        content = _resolve_llm_content(data)
+        if content is None:
+            logger.debug(
+                "LLM response missing recognized content field: %s",
+                json.dumps(data)[:500],
+            )
+            return _fallback_parse_relevance(json.dumps(data))
+        result = _parse_llm_json(content)
+        if result is None:
+            logger.debug("LLM JSON parse failed; raw content: %s", content[:500])
+            return _fallback_parse_relevance(content)
+        return result
+    except (requests.RequestException, json.JSONDecodeError) as exc:
+        logger.warning("LLM call failed: %s", exc)
+        return None
+
+
+def _parse_llm_json(text: str) -> Optional[dict]:
+    """Extract and parse JSON from LLM response text."""
+    text = text.strip()
+    json_start = text.find("{")
+    json_end = text.rfind("}")
+    if json_start == -1 or json_end == -1:
+        return None
+    try:
+        return json.loads(text[json_start : json_end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+class NewsEnricher:
+    """Service for enriching CIAA cases with related news articles.
+
+    Pipeline per case:
+    1. Generate search queries from case metadata
+    2. Search for candidate news articles
+    3. Deduplicate candidate URLs
+    4. Fetch article content
+    5. Verify relevance with LLM
+    6. Extract article metadata and images
+    7. Store as DocumentSource with MEDIA_NEWS type
+    8. Link to Case.evidence
+    """
+
+    def __init__(
+        self,
+        llm_model: str = "gpt-4.5",
+        llm_base_url: Optional[str] = None,
+        llm_api_key: Optional[str] = None,
+        max_articles_per_case: int = 5,
+        search_delay: float = 1.0,
+        fetch_delay: float = 0.5,
+        verbose: bool = False,
+    ):
+        self.llm_model = llm_model
+        self.llm_base_url = llm_base_url or os.environ.get(
+            "JAWAFDEHI_LLM_PROXY_URL", "https://llm-proxy.jawafdehi.org/v1"
+        )
+        self.llm_api_key = llm_api_key
+        self.max_articles_per_case = max_articles_per_case
+        self.search_delay = search_delay
+        self.fetch_delay = fetch_delay
+        self.verbose = verbose
+        self._existing_url_map: dict[str, str] = {}
+        self._llm_configured = (
+            bool(llm_api_key)
+            or bool(os.environ.get("JAWAFDEHI_LLM_API_KEY"))
+            or bool(os.environ.get("ANTHROPIC_API_KEY"))
+        )
+
+    def _resolve_api_key(self, cli_key: Optional[str]) -> Optional[str]:
+        """Resolve LLM API key."""
+        if cli_key:
+            return cli_key
+        return os.environ.get("JAWAFDEHI_LLM_API_KEY") or os.environ.get(
+            "ANTHROPIC_API_KEY"
+        )
+
+    def enrich_case(
+        self,
+        case: Case,
+        dry_run: bool = False,
+        force: bool = False,
+        case_num: int = 0,
+        total_cases: int = 0,
+    ) -> dict:
+        """Enrich a single case with news articles.
+
+        Returns stats dict with status and counters.
+        """
+        api_key = self._resolve_api_key(self.llm_api_key)
+        if not dry_run and not api_key:
+            return {
+                "status": "skipped",
+                "reason": "no_llm_key",
+                "searched": 0,
+                "fetched": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "errors": 0,
+                "already_linked": 0,
+                "new_sources": 0,
+            }
+        if dry_run and not api_key:
+            logger.warning(
+                "No LLM API key configured — article relevance verification disabled. "
+                "Set JAWAFDEHI_LLM_API_KEY, ANTHROPIC_API_KEY, or use --llm-api-key."
+            )
+
+        case_number = _resolve_case_number(case)
+        self._log_case_progress(case, case_number, case_num, total_cases)
+
+        stats = {
+            "status": "processed",
+            "searched": 0,
+            "fetched": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "errors": 0,
+            "already_linked": 0,
+            "new_sources": 0,
+        }
+
+        case_linked_urls = self._get_case_linked_urls(case)
+        global_existing_urls, self._existing_url_map = self._get_existing_url_metadata()
+
+        queries = _generate_query_variations(case)
+        if not queries:
+            logger.info("  No search queries generated")
+            stats["status"] = "skipped"
+            stats["reason"] = "no_queries"
+            return stats
+
+        press_release_text = self._get_press_release_content(case)
+        if press_release_text:
+            logger.info(
+                "  INFO: Press release context: %d chars", len(press_release_text)
+            )
+        else:
+            logger.warning(
+                "  WARNING: no press release text — LLM verification will lack official case context"
+            )
+
+        all_candidates = self._search_candidates(queries, stats)
+
+        new_candidates, already_linked = self._filter_case_candidates(
+            all_candidates, case_linked_urls, global_existing_urls, force
+        )
+
+        if already_linked > 0:
+            logger.info("  %d URLs already linked as evidence", already_linked)
+            stats["already_linked"] = already_linked
+
+        if not new_candidates and already_linked > 0 and not force:
+            stats["status"] = "skipped"
+            stats["reason"] = "all_already_linked"
+            return stats
+
+        accepted = self._fetch_and_verify_candidates(
+            new_candidates, case, api_key, stats, press_release_text
+        )
+
+        if not accepted and stats.get("already_linked", 0) == 0:
+            stats["status"] = "no_articles"
+            return stats
+
+        stats["new_sources"] = self._handle_enrichment_results(case, accepted, dry_run)
+
+        return stats
+
+    def _search_candidates(self, queries: list[str], stats: dict) -> list[dict]:
+        """Execute search queries and collect deduplicated candidate results."""
+        all_candidates = []
+        seen_urls = set()
+        for query in queries:
+            try:
+                results = _search_duckduckgo(query)
+                stats["searched"] += 1
+                new_count = 0
+                for r in results:
+                    url = r["url"]
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        all_candidates.append(r)
+                        new_count += 1
+                logger.info(
+                    "  query '%s' → %d results (%d new)",
+                    query[:70],
+                    len(results),
+                    new_count,
+                )
+                time.sleep(self.search_delay)
+            except Exception as exc:
+                logger.warning("  Search error for '%s': %s", query[:60], exc)
+                stats["errors"] += 1
+
+        logger.info(
+            "  Found %d candidate URLs from %d queries",
+            len(all_candidates),
+            len(queries),
+        )
+        return all_candidates
+
+    def _fetch_and_verify_candidates(
+        self,
+        candidates: list[dict],
+        case: Case,
+        api_key: Optional[str],
+        stats: dict,
+        press_release_text: Optional[str] = None,
+    ) -> list[dict]:
+        """Fetch and verify candidate articles, returning accepted articles."""
+        accepted = []
+        for candidate in candidates:
+            if len(accepted) >= self.max_articles_per_case:
+                break
+            result = self._process_candidate(
+                candidate, case, api_key, stats, press_release_text
+            )
+            if result:
+                accepted.append(result)
+                stats["accepted"] += 1
+                logger.info(
+                    "  Accepted: %s (confidence: %s)",
+                    candidate["url"][:80],
+                    result["confidence"],
+                )
+        return accepted
+
+    def _process_candidate(
+        self,
+        candidate: dict,
+        case: Case,
+        api_key: Optional[str],
+        stats: dict,
+        press_release_text: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Process a single candidate article. Returns accepted article dict or None."""
+        url = candidate["url"]
+
+        if _is_official_press_release(url):
+            logger.info("  skipped: official CIAA press release — %s", url[:80])
+            return None
+
+        blocklist_reason = _is_url_blocklisted(url)
+        if blocklist_reason:
+            logger.info("  skipped: %s — %s", blocklist_reason, url[:80])
+            return None
+
+        stats["fetched"] += 1
+        try:
+            html = _fetch_article_content(url)
+            if not html:
+                logger.debug("  Failed to fetch content: %s", url)
+                return None
+
+            article_text = _extract_text_from_html(html)
+            if len(article_text) < 100:
+                logger.debug(
+                    "  Insufficient content from %s (%d chars)", url, len(article_text)
+                )
+                return None
+
+            article_title = _extract_title_from_html(html) or candidate.get("title", "")
+            article_excerpt = article_text[:2000]
+
+            if api_key and self.llm_base_url:
+                is_relevant, confidence, reason = self._verify_article_relevance(
+                    case=case,
+                    article_title=article_title,
+                    article_url=url,
+                    article_excerpt=article_excerpt[:3000],
+                    api_key=api_key,
+                    press_release_text=press_release_text,
+                )
+            else:
+                is_relevant = False
+                confidence = "none"
+                reason = "LLM not configured"
+
+            if not is_relevant:
+                stats["rejected"] += 1
+                if self.verbose:
+                    logger.info("  rejected: %s — %s", url[:80], reason)
+                else:
+                    logger.debug("  rejected: %s — %s", url[:80], reason)
+                return None
+
+            images = _extract_images_from_html(html, base_url=url)
+            article_date = _extract_publication_date(html)
+            return {
+                "title": article_title,
+                "url": url,
+                "text": article_text,
+                "images": images,
+                "publication_date": article_date,
+                "confidence": confidence,
+                "reason": reason,
+            }
+        except Exception as exc:
+            exc_type = type(exc).__name__
+            logger.warning("  error: %s — %s: %s", exc_type, url[:80], exc)
+            stats["errors"] += 1
+            return None
+        finally:
+            time.sleep(self.fetch_delay)
+
+    @staticmethod
+    def _extract_urls_from_source(source: DocumentSource) -> list[str]:
+        """Extract individual URL strings from a DocumentSource's url field."""
+        if isinstance(source.url, list):
+            return [u for u in source.url if isinstance(u, str)]
+        return []
+
+    @staticmethod
+    def _extract_source_ids_from_evidence(evidence: list) -> set[str]:
+        """Extract source_id values from case evidence entries."""
+        if not evidence:
+            return set()
+        return {
+            entry["source_id"]
+            for entry in evidence
+            if isinstance(entry, dict) and entry.get("source_id")
+        }
+
+    def _get_existing_article_urls(self) -> set[str]:
+        """Get set of article URLs already stored as DocumentSource."""
+        return set(self._get_url_to_source_map().keys())
+
+    def _get_url_to_source_map(self) -> dict[str, str]:
+        """Get mapping from URL to source_id for existing MEDIA_NEWS sources."""
+        url_map = {}
+        try:
+            for source in DocumentSource.objects.filter(
+                source_type=SourceType.MEDIA_NEWS, is_deleted=False
+            ).only("url", "source_id"):
+                for u in self._extract_urls_from_source(source):
+                    if u not in url_map:
+                        url_map[u] = source.source_id
+        except Exception:
+            logger.exception("Failed to load URL-to-source map")
+        return url_map
+
+    def _get_existing_url_metadata(self) -> tuple[set[str], dict[str, str]]:
+        """Get existing article URLs and URL→source_id mapping in one pass."""
+        urls = set()
+        url_map = {}
+        try:
+            for source in DocumentSource.objects.filter(
+                source_type=SourceType.MEDIA_NEWS, is_deleted=False
+            ).only("url", "source_id"):
+                if isinstance(source.url, list):
+                    for u in source.url:
+                        if isinstance(u, str):
+                            urls.add(u)
+                            if u not in url_map:
+                                url_map[u] = source.source_id
+        except Exception:
+            logger.exception("Failed to load existing URL metadata")
+        return urls, url_map
+
+    def _get_case_linked_urls(self, case: Case) -> set[str]:
+        """Get set of URLs already linked to this specific case via evidence."""
+        linked_urls = set()
+        source_ids = self._extract_source_ids_from_evidence(case.evidence)
+        if not source_ids:
+            return linked_urls
+        try:
+            for source in DocumentSource.objects.filter(
+                source_id__in=source_ids,
+                source_type=SourceType.MEDIA_NEWS,
+                is_deleted=False,
+            ).only("url"):
+                linked_urls.update(self._extract_urls_from_source(source))
+        except Exception:
+            logger.exception("Failed to fetch linked URLs for case")
+        return linked_urls
+
+    def _log_case_progress(
+        self, case: Case, case_number: Optional[str], case_num: int, total_cases: int
+    ) -> None:
+        """Log enrichment progress for a case."""
+        if case_num and total_cases:
+            cn_str = f" (#{case_number})" if case_number else ""
+            logger.info(
+                "[%d/%d] Processing %s%s — %s",
+                case_num,
+                total_cases,
+                case.case_id,
+                cn_str,
+                (case.title or "")[:70],
+            )
+        else:
+            logger.info("Processing %s...", case.case_id)
+
+    def _filter_case_candidates(
+        self,
+        all_candidates: list[dict],
+        case_linked_urls: set[str],
+        global_existing_urls: set[str],
+        force: bool,
+    ) -> tuple[list[dict], int]:
+        """Split candidates into new vs already-linked."""
+        new_candidates = []
+        already_linked = 0
+        for c in all_candidates:
+            url = c["url"]
+            if url in case_linked_urls:
+                already_linked += 1
+            elif not force and url in global_existing_urls:
+                already_linked += 1
+            else:
+                new_candidates.append(c)
+        return new_candidates, already_linked
+
+    def _handle_enrichment_results(
+        self, case: Case, accepted: list[dict], dry_run: bool
+    ) -> int:
+        """Save articles or log dry-run. Returns new_sources count."""
+        if not dry_run and accepted:
+            return self._save_articles(case, accepted)
+        if dry_run and accepted:
+            logger.info("  [DRY RUN] Would save %d article(s)", len(accepted))
+            for a in accepted:
+                logger.info("    - %s", a["url"][:80])
+        return 0
+
+    def _verify_article_relevance(
+        self,
+        case: Case,
+        article_title: str,
+        article_url: str,
+        article_excerpt: str,
+        api_key: str,
+        press_release_text: Optional[str] = None,
+    ) -> tuple[bool, str, str]:
+        """Use LLM to verify if an article is about the same case.
+
+        Returns (is_relevant, confidence, reason).
+        """
+        case_number = _resolve_case_number(case)
+
+        case_context = f"""Case Title: {case.title or 'Unknown'}
+Court Case Number: {case_number or 'Unknown'}
+Short Description: {case.short_description or 'Not provided'}
+Key Allegations: {', '.join(case.key_allegations[:5]) if case.key_allegations else 'None'}"""
+
+        if press_release_text:
+            case_context += f"""
+
+Press Release Text (official CIAA document):
+{press_release_text[:1000]}"""
+        else:
+            case_context += """
+
+No official press release text available."""
+
+        user_prompt = f"""Determine if this news article is about the same corruption case.
+
+CASE CONTEXT:
+{case_context}
+
+ARTICLE:
+Title: {article_title}
+URL: {article_url}
+Excerpt: {article_excerpt}"""
+
+        logger.debug(
+            "LLM verify context for %s: case=%s case#=%s press_release_chars=%d article_title=%s",
+            article_url[:80],
+            case.case_id,
+            case_number or "none",
+            len(press_release_text) if press_release_text else 0,
+            article_title[:80],
+        )
+
+        result = _call_llm(
+            system_prompt=_VERIFY_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            model=self.llm_model,
+            base_url=self.llm_base_url,
+            api_key=api_key,
+        )
+
+        if result is None:
+            return False, "error", "LLM response could not be parsed"
+
+        relevant = result.get("relevant", False)
+        confidence = result.get("confidence", "medium")
+        reason = result.get("reason", "")
+
+        logger.debug(
+            "LLM verdict for %s: relevant=%s confidence=%s reason=%s",
+            article_url[:80],
+            relevant,
+            confidence,
+            reason,
+        )
+
+        return relevant, confidence, reason
+
+    def _get_press_release_content(self, case: Case) -> Optional[str]:
+        """Extract press release text for a CIAA case from evidence-linked sources.
+
+        Strategy:
+        1. Look for DocumentSource records linked via evidence with press release
+           content in the description field.
+        2. For sources with ciaa.gov.np URLs, try downloading the corresponding
+           NGM-stored PDF via ngm-store.jawafdehi.org and converting via likhit.
+        3. Collect content from all matching sources.
+        """
+        source_ids = self._extract_source_ids_from_evidence(case.evidence)
+        if not source_ids:
+            logger.debug("  No valid source_ids in evidence")
+            return None
+
+        sources = list(
+            DocumentSource.objects.filter(
+                source_id__in=source_ids, is_deleted=False
+            ).only("source_id", "description", "title", "url")
+        )
+        if not sources:
+            logger.debug(
+                "  No matching DocumentSource records found (%d IDs)", len(source_ids)
+            )
+            return None
+
+        source_by_id = {s.source_id: s for s in sources}
+        press_release_parts = []
+
+        for sid in source_ids:
+            source = source_by_id.get(sid)
+            if source is None:
+                continue
+            if not self._is_press_release_source(source):
+                continue
+
+            description = (source.description or "").strip()
+            if len(description) > 200:
+                press_release_parts.append(description)
+                logger.debug(
+                    "  Press release text from source %s: %d chars",
+                    source.source_id,
+                    len(description),
+                )
+            elif isinstance(source.url, list):
+                for url in source.url:
+                    if not self._is_pdf_url(url):
+                        continue
+                    parsed = urlparse(url)
+                    if parsed.hostname and parsed.hostname in _ALLOWED_HOSTS:
+                        content = self._convert_to_markdown(url)
+                        if content and len(content) > 200:
+                            press_release_parts.append(content)
+                            logger.debug(
+                                "  Press release text from URL %s: %d chars",
+                                url,
+                                len(content),
+                            )
+                            break
+
+        if not press_release_parts:
+            logger.debug(
+                "  No press release text extracted from %d matching source(s)",
+                sum(
+                    1
+                    for sid in source_ids
+                    if source_by_id.get(sid)
+                    and self._is_press_release_source(source_by_id[sid])
+                ),
+            )
+            return None
+
+        combined = "\n\n".join(press_release_parts)
+        logger.debug(
+            "  Press release content from %d source(s): %d total chars",
+            len(press_release_parts),
+            len(combined),
+        )
+        return combined
+
+    def _collect_press_release_parts(
+        self, source_ids: list[str], source_by_id: dict[str, DocumentSource]
+    ) -> list[str]:
+        """Collect press release text from descriptions and downloadable URLs."""
+        parts = []
+        for sid in source_ids:
+            source = source_by_id.get(sid)
+            if source is None or not self._is_press_release_source(source):
+                continue
+            self._extract_text_from_source(source, parts)
+        return parts
+
+    def _extract_text_from_source(
+        self, source: DocumentSource, parts: list[str]
+    ) -> None:
+        """Extract press release text from a source's description or .pdf URLs only.
+
+        Ignores .doc/.docx files and web/HTML pages — only .pdf files from
+        allowed hosts are downloaded and converted.
+        """
+        description = (source.description or "").strip()
+        if len(description) > 200:
+            parts.append(description)
+            logger.debug(
+                "  Press release text from source %s: %d chars",
+                source.source_id,
+                len(description),
+            )
+            return
+
+        if isinstance(source.url, list):
+            for url in source.url:
+                if not self._is_pdf_url(url):
+                    continue
+                parsed = urlparse(url)
+                if parsed.hostname and parsed.hostname in _ALLOWED_HOSTS:
+                    content = self._convert_to_markdown(url)
+                    if content and len(content) > 200:
+                        parts.append(content)
+                        logger.debug(
+                            "  Press release text from URL %s: %d chars",
+                            url,
+                            len(content),
+                        )
+                        break
+
+    @staticmethod
+    def _is_pdf_url(url: str) -> bool:
+        """Return True if the URL points to a .pdf file."""
+        parsed = urlparse(url)
+        path = parsed.path.lower()
+        return path.endswith(".pdf")
+
+    def _is_press_release_source(self, source: DocumentSource) -> bool:
+        """Check if a DocumentSource is a CIAA press release.
+
+        Excludes court order documents (judgments, verdicts, orders).
+        """
+        title_lower = (source.title or "").lower()
+        if self._is_court_order_title(title_lower):
+            return False
+
+        if "press release" in title_lower or "ciaa" in title_lower:
+            return True
+
+        if isinstance(source.url, list):
+            for url in source.url:
+                parsed = urlparse(url)
+                if parsed.hostname and parsed.hostname in _ALLOWED_HOSTS:
+                    return True
+        return False
+
+    @staticmethod
+    def _is_court_order_title(title_lower: str) -> bool:
+        """Check if a title suggests a court order document rather than a press release."""
+        court_keywords = (
+            "court order",
+            "judgment",
+            "verdict",
+            "फैसला",
+            "आदेश",
+            "निर्णय",
+        )
+        return any(kw in title_lower for kw in court_keywords)
+
+    def _convert_to_markdown(self, url: str) -> Optional[str]:
+        """Download file from URL and convert to markdown using likhit/markitdown.
+
+        Pipeline: URL download -> temp file -> likhit/markitdown -> markdown.
+        Returns None when conversion fails or produces insufficient content.
+        """
+        try:
+            response = requests.get(url, timeout=120, stream=True)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("  Failed to download %s: %s", url, exc)
+            return None
+
+        final_hostname = urlparse(response.url).hostname
+        if final_hostname not in _ALLOWED_HOSTS:
+            logger.warning("  Redirected to untrusted host: %s", response.url)
+            return None
+
+        content_type = response.headers.get("content-type", "").lower()
+
+        text_result = self._handle_text_response(response, content_type)
+        if text_result is not None:
+            return text_result
+
+        return self._convert_binary_response(response, content_type, url)
+
+    def _handle_text_response(self, response, content_type: str) -> Optional[str]:
+        """Handle plain text or JSON responses directly."""
+        if "text/plain" in content_type or "application/json" in content_type:
+            response.encoding = "utf-8"
+            text = response.text
+            if len(text) > 200:
+                return text
+            return None
+        return None
+
+    @staticmethod
+    def _determine_suffix(content_type: str) -> str:
+        """Determine file suffix from content-type header."""
+        if "pdf" in content_type:
+            return ".pdf"
+        if "html" in content_type:
+            return ".html"
+        if any(kw in content_type for kw in ("document", "word", "docx", "msword")):
+            return ".docx"
+        return ""
+
+    def _convert_binary_response(
+        self, response, content_type: str, url: str
+    ) -> Optional[str]:
+        """Save response to temp file and convert via markitdown."""
+        import importlib.util
+
+        suffix = self._determine_suffix(content_type)
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                tmp_path = tmp.name
+                for chunk in response.iter_content(chunk_size=8192):
+                    tmp.write(chunk)
+
+            if importlib.util.find_spec("likhit"):
+                import likhit  # noqa: F401
+
+            from markitdown import MarkItDown
+
+            md = MarkItDown(enable_plugins=True)
+            result = md.convert(tmp_path)
+
+            if (
+                result
+                and result.text_content
+                and len(result.text_content.strip()) > 200
+            ):
+                return result.text_content.strip()
+
+            logger.warning(
+                "  Markitdown conversion produced insufficient content for %s", url
+            )
+            return None
+        except Exception as exc:
+            logger.warning("  Markitdown conversion failed for %s: %s", url, exc)
+            return None
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink()
+                except OSError:
+                    pass
+
+    def _save_articles(self, case: Case, articles: list[dict]) -> int:
+        """Save accepted articles as DocumentSource and link to case evidence.
+
+        Returns number of new sources created.
+        """
+        new_count = 0
+        evidence = list(case.evidence) if case.evidence else []
+        existing_source_ids = self._extract_source_ids_from_evidence(evidence)
+        url_to_source = self._existing_url_map
+
+        with transaction.atomic():
+            for article in articles:
+                url = article["url"]
+                existing_source_id = url_to_source.get(url)
+
+                if existing_source_id:
+                    if existing_source_id not in existing_source_ids:
+                        evidence.append(
+                            {
+                                "source_id": existing_source_id,
+                                "description": self._build_evidence_description(
+                                    article
+                                ),
+                            }
+                        )
+                        existing_source_ids.add(existing_source_id)
+                    continue
+
+                source = self._create_document_source(article)
+                url_to_source[url] = source.source_id
+                new_count += 1
+
+                if source.source_id not in existing_source_ids:
+                    evidence.append(
+                        {
+                            "source_id": source.source_id,
+                            "description": self._build_evidence_description(article),
+                        }
+                    )
+                    existing_source_ids.add(source.source_id)
+
+            case.evidence = evidence
+            case.save(update_fields=["evidence", "updated_at"])
+
+        return new_count
+
+    def _create_document_source(self, article: dict) -> DocumentSource:
+        """Create a DocumentSource record for an accepted news article."""
+        description = self._build_source_description(article)
+        pub_date = article.get("publication_date")
+        if pub_date is None:
+            pub_date = date.today()
+
+        source = DocumentSource(
+            title=article["title"] or "Untitled News Article",
+            description=description,
+            source_type=SourceType.MEDIA_NEWS,
+            url=[article["url"]],
+            publication_date=pub_date,
+        )
+        source.save()
+        return source
+
+    def _build_source_description(self, article: dict) -> str:
+        """Build structured markdown description for a news article source."""
+        outlet = _guess_outlet(article.get("url", ""))
+        pub_date = article.get("publication_date")
+
+        parts = []
+        summary = _summarize_for_description(article)
+        if summary:
+            parts.append(summary)
+        else:
+            parts.append(f"News article from {outlet}")
+
+        parts.append("")
+        parts.append(f"Article URL: {article['url']}")
+        if pub_date:
+            parts.append(f"Publication date: {pub_date.isoformat()}")
+        else:
+            parts.append("Publication date: unknown")
+
+        confidence = article.get("confidence", "unknown")
+        reason = article.get("reason", "")
+        parts.append(f"LLM verification: {confidence} confidence — {reason}")
+
+        images = article.get("images", [])
+        if images:
+            parts.append("")
+            parts.append("Images:")
+            for img in images[:5]:
+                alt = img.get("alt", "")
+                alt_text = f" — {alt}" if alt else ""
+                parts.append(f"- {img['url']}{alt_text}")
+
+        return "\n".join(parts)
+
+    def _build_evidence_description(self, article: dict) -> str:
+        """Build evidence entry description in Nepali."""
+        outlet = _guess_outlet(article.get("url", ""))
+        pub_date = article.get("publication_date")
+
+        date_str = ""
+        if pub_date:
+            date_str = f" ({pub_date.isoformat()})"
+
+        return f"{outlet}{date_str} ले यस मुद्दासम्बन्धी समाचार प्रकाशित गरेको।"
+
+
+def _guess_outlet(url: str) -> str:
+    """Guess news outlet name from URL."""
+    try:
+        hostname = urlparse(url).hostname or ""
+        hostname = re.sub(r"^www\d*\.", "", hostname)
+        parts = hostname.split(".")
+        if len(parts) >= 2:
+            return parts[-2].title()
+        return hostname
+    except Exception:
+        return "Unknown"
+
+
+def _summarize_for_description(article: dict) -> str:
+    """Create a one-line summary from article data."""
+    title = article.get("title", "")
+    if title:
+        return title[:150]
+    return ""
+
+
+def _parse_date_string(date_str: str) -> Optional[date]:
+    """Try to parse a date string using common formats. Returns date or None."""
+    date_str = date_str[:19]
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(date_str[: len(fmt.replace("%Z", ""))], fmt)
+            return dt.date()
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_publication_date(html: str) -> Optional[date]:
+    """Extract publication date from HTML meta tags or content."""
+    safe_html = _truncate_for_regex(html)
+    patterns = [
+        r'<meta[^>]+?property="article:published_time"[^>]+?content="([^"]+)"',
+        r'<meta[^>]+?name="[^"]*date[^"]*"[^>]+?content="([^"]+)"',
+        r'<meta[^>]+?itemprop="datePublished"[^>]+?content="([^"]+)"',
+        r'"datePublished"\s*:\s*"([^"]+)"',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, safe_html, re.IGNORECASE)
+        if match:
+            result = _parse_date_string(match.group(1))
+            if result is not None:
+                return result
+
+    nepali_date_pattern = re.compile(
+        r"(?:प्रकाशित|मिति)[:\s]*(\d{4})[-/](\d{1,2})[-/](\d{1,2})"
+    )
+    match = nepali_date_pattern.search(safe_html)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            pass
+
+    return None
+
+
+def enrich_cases_batch(
+    enricher: NewsEnricher,
+    cases,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict:
+    """Enrich multiple cases and return aggregate stats."""
+    stats = {
+        "total": 0,
+        "processed": 0,
+        "skipped": 0,
+        "searched": 0,
+        "fetched": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "errors": 0,
+        "already_linked": 0,
+        "new_sources": 0,
+    }
+
+    cases_list = list(cases)
+    total = len(cases_list)
+
+    for idx, case in enumerate(cases_list, 1):
+        stats["total"] += 1
+        try:
+            result = enricher.enrich_case(
+                case,
+                dry_run=dry_run,
+                force=force,
+                case_num=idx,
+                total_cases=total,
+            )
+            if result["status"] in ("skipped", "no_articles"):
+                stats["skipped"] += 1
+            else:
+                stats["processed"] += 1
+
+            stats["searched"] += result.get("searched", 0)
+            stats["fetched"] += result.get("fetched", 0)
+            stats["accepted"] += result.get("accepted", 0)
+            stats["rejected"] += result.get("rejected", 0)
+            stats["errors"] += result.get("errors", 0)
+            stats["already_linked"] += result.get("already_linked", 0)
+            stats["new_sources"] += result.get("new_sources", 0)
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.exception("Failed to process %s: %s", case.case_id, exc)
+
+    return stats
