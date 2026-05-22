@@ -1567,6 +1567,8 @@ def enrich_cases_batch(
         "errors": 0,
         "already_linked": 0,
         "new_sources": 0,
+        "cases_with_articles": 0,
+        "cases_no_articles": 0,
     }
 
     cases_list = list(cases)
@@ -1594,6 +1596,10 @@ def enrich_cases_batch(
             stats["errors"] += result.get("errors", 0)
             stats["already_linked"] += result.get("already_linked", 0)
             stats["new_sources"] += result.get("new_sources", 0)
+            if result.get("accepted", 0) > 0:
+                stats["cases_with_articles"] += 1
+            else:
+                stats["cases_no_articles"] += 1
         except Exception as exc:
             stats["errors"] += 1
             logger.exception("Failed to process %s: %s", case.case_id, exc)

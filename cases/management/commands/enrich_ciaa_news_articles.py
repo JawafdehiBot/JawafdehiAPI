@@ -277,6 +277,10 @@ class Command(BaseCommand):
         if total > 0:
             self.stdout.write(f"Processed:       {stats.get('processed', 0)}")
             self.stdout.write(f"Skipped:         {stats.get('skipped', 0)}")
+            self.stdout.write(
+                f"Cases w/ articles:{stats.get('cases_with_articles', 0)}"
+            )
+            self.stdout.write(f"Cases no articles:{stats.get('cases_no_articles', 0)}")
             self.stdout.write("")
             self.stdout.write(f"Searches:        {stats.get('searched', 0)}")
             self.stdout.write(f"Articles fetched:{stats.get('fetched', 0)}")
