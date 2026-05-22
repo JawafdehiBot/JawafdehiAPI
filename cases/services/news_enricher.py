@@ -170,13 +170,51 @@ def _extract_text_from_html(html: str) -> str:
 
 
 def _extract_images_from_html(html: str, base_url: str = "") -> list[dict]:
-    """Extract image URLs from HTML."""
+    """Extract content-relevant image URLs from HTML, filtering out non-editorial images."""
     parser = _ImageExtractor(base_url=base_url)
     try:
         parser.feed(html)
     except Exception:
         pass
-    return parser.images
+    return _filter_content_images(parser.images)
+
+
+_IMAGE_FILTER_PATTERNS = [
+    re.compile(r"/logo[/_-]?", re.IGNORECASE),
+    re.compile(r"/banner[/_-]?", re.IGNORECASE),
+    re.compile(r"/ad(?:vertisement)?[/_-]?", re.IGNORECASE),
+    re.compile(r"/icon[/_-]?", re.IGNORECASE),
+    re.compile(r"\.gif(\?|$)", re.IGNORECASE),
+    re.compile(r"/pixel[/_-]?", re.IGNORECASE),
+    re.compile(r"/track(?:ing)?[/_-]?", re.IGNORECASE),
+    re.compile(r"/widget[/_-]?", re.IGNORECASE),
+    re.compile(r"/avatar[/_-]?", re.IGNORECASE),
+    re.compile(r"/social[/_-]?", re.IGNORECASE),
+    re.compile(r"/share[/_-]?", re.IGNORECASE),
+    re.compile(r"/button[/_-]?", re.IGNORECASE),
+    re.compile(r"/promo[/_-]?", re.IGNORECASE),
+]
+_IMAGE_ALT_BLOCKLIST = frozenset(
+    {"logo", "banner", "ad", "icon", "avatar", "thumb", "pixel", "sponsor"}
+)
+
+
+def _filter_content_images(images: list[dict]) -> list[dict]:
+    """Remove non-editorial images (logos, ads, trackers, icons, etc.)."""
+    filtered = []
+    for img in images:
+        url = img.get("url", "")
+        alt = (img.get("alt", "") or "").lower().strip()
+
+        if any(w in alt for w in _IMAGE_ALT_BLOCKLIST):
+            continue
+
+        url_lower = url.lower()
+        if any(p.search(url_lower) for p in _IMAGE_FILTER_PATTERNS):
+            continue
+
+        filtered.append(img)
+    return filtered
 
 
 def _extract_title_from_html(html: str) -> str:
@@ -1330,51 +1368,27 @@ Excerpt: {article_excerpt}"""
     def _create_document_source(self, article: dict) -> DocumentSource:
         """Create a DocumentSource record for an accepted news article."""
         description = self._build_source_description(article)
-        pub_date = article.get("publication_date")
-        if pub_date is None:
-            pub_date = date.today()
 
         source = DocumentSource(
             title=article["title"] or "Untitled News Article",
             description=description,
             source_type=SourceType.MEDIA_NEWS,
             url=[article["url"]],
-            publication_date=pub_date,
         )
         source.save()
         return source
 
     def _build_source_description(self, article: dict) -> str:
-        """Build structured markdown description for a news article source."""
-        outlet = _guess_outlet(article.get("url", ""))
-        pub_date = article.get("publication_date")
-
-        parts = []
-        summary = _summarize_for_description(article)
-        if summary:
-            parts.append(summary)
-        else:
-            parts.append(f"News article from {outlet}")
-
-        parts.append("")
-        parts.append(f"Article URL: {article['url']}")
-        if pub_date:
-            parts.append(f"Publication date: {pub_date.isoformat()}")
-        else:
-            parts.append("Publication date: unknown")
-
-        confidence = article.get("confidence", "unknown")
-        reason = article.get("reason", "")
-        parts.append(f"LLM verification: {confidence} confidence — {reason}")
-
+        """Build description containing only content-relevant image URLs."""
         images = article.get("images", [])
-        if images:
-            parts.append("")
-            parts.append("Images:")
-            for img in images[:5]:
-                alt = img.get("alt", "")
-                alt_text = f" — {alt}" if alt else ""
-                parts.append(f"- {img['url']}{alt_text}")
+        if not images:
+            return ""
+
+        parts = ["Images:"]
+        for img in images[:10]:
+            alt = img.get("alt", "")
+            alt_text = f" — {alt}" if alt else ""
+            parts.append(f"- {img['url']}{alt_text}")
 
         return "\n".join(parts)
 
