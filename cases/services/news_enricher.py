@@ -579,10 +579,13 @@ def _call_llm(
         except requests.RequestException as exc:
             last_exc = exc
             if attempt < max_retries:
-                delay = 2 ** attempt
+                delay = 2**attempt
                 logger.warning(
                     "LLM call attempt %d/%d failed: %s — retrying in %ds",
-                    attempt, max_retries, exc, delay,
+                    attempt,
+                    max_retries,
+                    exc,
+                    delay,
                 )
                 time.sleep(delay)
                 continue
@@ -1015,7 +1018,13 @@ class NewsEnricher:
         Only URLs already in this case's evidence are counted as already-linked.
         URLs that exist globally but aren't linked to this case are processed
         so the existing DocumentSource can be attached to this case's evidence.
+
+        When force=True, all candidates are treated as new (already-linked
+        count is still reported but does not prevent processing).
         """
+        if force:
+            return list(all_candidates), 0
+
         new_candidates = []
         already_linked = 0
         for c in all_candidates:
