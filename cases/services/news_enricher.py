@@ -1059,15 +1059,15 @@ class NewsEnricher:
         When force=True, all candidates are treated as new (already-linked
         count is still reported but does not prevent processing).
         """
+        already_linked = sum(1 for c in all_candidates if c["url"] in case_linked_urls)
         if force:
-            return list(all_candidates), 0
+            return list(all_candidates), already_linked
 
         new_candidates = []
-        already_linked = 0
         for c in all_candidates:
             url = c["url"]
             if url in case_linked_urls:
-                already_linked += 1
+                continue
             else:
                 new_candidates.append(c)
         return new_candidates, already_linked
@@ -1596,9 +1596,9 @@ def enrich_cases_batch(
             stats["errors"] += result.get("errors", 0)
             stats["already_linked"] += result.get("already_linked", 0)
             stats["new_sources"] += result.get("new_sources", 0)
-            if result.get("accepted", 0) > 0:
+            if result.get("accepted", 0) > 0 or result.get("already_linked", 0) > 0:
                 stats["cases_with_articles"] += 1
-            else:
+            elif result.get("status") == "no_articles":
                 stats["cases_no_articles"] += 1
         except Exception as exc:
             stats["errors"] += 1
