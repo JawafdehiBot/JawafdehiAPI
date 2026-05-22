@@ -180,11 +180,13 @@ def _extract_images_from_html(html: str, base_url: str = "") -> list[dict]:
 
 
 _IMAGE_FILTER_PATTERNS = [
+    re.compile(r"\.svg(\?|$)", re.IGNORECASE),
+    re.compile(r"\.gif(\?|$)", re.IGNORECASE),
     re.compile(r"/logo[/_-]?", re.IGNORECASE),
     re.compile(r"/banner[/_-]?", re.IGNORECASE),
     re.compile(r"/ad(?:vertisement)?[/_-]?", re.IGNORECASE),
     re.compile(r"/icon[/_-]?", re.IGNORECASE),
-    re.compile(r"\.gif(\?|$)", re.IGNORECASE),
+    re.compile(r"header[_-]?icon", re.IGNORECASE),
     re.compile(r"/pixel[/_-]?", re.IGNORECASE),
     re.compile(r"/track(?:ing)?[/_-]?", re.IGNORECASE),
     re.compile(r"/widget[/_-]?", re.IGNORECASE),
@@ -193,9 +195,11 @@ _IMAGE_FILTER_PATTERNS = [
     re.compile(r"/share[/_-]?", re.IGNORECASE),
     re.compile(r"/button[/_-]?", re.IGNORECASE),
     re.compile(r"/promo[/_-]?", re.IGNORECASE),
+    re.compile(r"trn\.png", re.IGNORECASE),
+    re.compile(r"muna\.png", re.IGNORECASE),
 ]
 _IMAGE_ALT_BLOCKLIST = frozenset(
-    {"logo", "banner", "ad", "icon", "avatar", "thumb", "pixel", "sponsor"}
+    {"logo", "banner", "ad", "icon", "avatar", "thumb", "pixel", "sponsor", "header"}
 )
 
 
@@ -1385,16 +1389,14 @@ Excerpt: {article_excerpt}"""
         return source
 
     def _build_source_description(self, article: dict) -> str:
-        """Build description containing only content-relevant image URLs."""
+        """Build description containing only filtered image URLs."""
         images = article.get("images", [])
         if not images:
             return ""
 
         parts = ["Images:"]
         for img in images[:10]:
-            alt = img.get("alt", "")
-            alt_text = f" — {alt}" if alt else ""
-            parts.append(f"- {img['url']}{alt_text}")
+            parts.append(f"- {img['url']}")
 
         return "\n".join(parts)
 
