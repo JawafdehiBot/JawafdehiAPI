@@ -157,6 +157,21 @@ class _ImageExtractor(HTMLParser):
                 self.images.append({"url": full_url, "alt": alt})
 
 
+def _sanitize_article_text(text: str) -> str:
+    """Normalize article text to clean UTF-8 and strip null bytes.
+
+    Encodes to UTF-8 and decodes back with 'replace' to fix mojibake
+    (e.g. à¤à¤¾à¤¬à¤¹ from mis-handled Nepali Unicode) and strips
+    null bytes that can appear from broken HTML parsing.
+    """
+    text = text.replace("\x00", "")
+    try:
+        text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+    return text.strip()
+
+
 def _extract_text_from_html(html: str) -> str:
     """Extract visible text from HTML."""
     parser = _TextExtractor()
@@ -182,10 +197,10 @@ def _extract_images_from_html(html: str, base_url: str = "") -> list[dict]:
 _IMAGE_FILTER_PATTERNS = [
     re.compile(r"\.svg(\?|$)", re.IGNORECASE),
     re.compile(r"\.gif(\?|$)", re.IGNORECASE),
-    re.compile(r"/logo[/_-]?", re.IGNORECASE),
-    re.compile(r"/banner[/_-]?", re.IGNORECASE),
+    re.compile(r"[-_]?logo[/_.-]", re.IGNORECASE),
+    re.compile(r"[-_]?banner[/_.-]", re.IGNORECASE),
     re.compile(r"/ad(?:vertisement)?[/_-]?", re.IGNORECASE),
-    re.compile(r"/icon[/_-]?", re.IGNORECASE),
+    re.compile(r"[-_]?icon[/_.-]", re.IGNORECASE),
     re.compile(r"header[_-]?icon", re.IGNORECASE),
     re.compile(r"/pixel[/_-]?", re.IGNORECASE),
     re.compile(r"/track(?:ing)?[/_-]?", re.IGNORECASE),
@@ -197,9 +212,31 @@ _IMAGE_FILTER_PATTERNS = [
     re.compile(r"/promo[/_-]?", re.IGNORECASE),
     re.compile(r"trn\.png", re.IGNORECASE),
     re.compile(r"muna\.png", re.IGNORECASE),
+    re.compile(r"app[_-]?store", re.IGNORECASE),
+    re.compile(r"play[_-]?store", re.IGNORECASE),
+    re.compile(r"google[_-]?play", re.IGNORECASE),
+    re.compile(r"flaticon\.com", re.IGNORECASE),
+    re.compile(r"cdn-icons", re.IGNORECASE),
+    re.compile(r"/bigyaapan/", re.IGNORECASE),
+    re.compile(r"/authors/", re.IGNORECASE),
+    re.compile(r"facebook\.com/tr", re.IGNORECASE),
 ]
 _IMAGE_ALT_BLOCKLIST = frozenset(
-    {"logo", "banner", "ad", "icon", "avatar", "thumb", "pixel", "sponsor", "header"}
+    {
+        "logo",
+        "banner",
+        "ad",
+        "icon",
+        "avatar",
+        "thumb",
+        "pixel",
+        "sponsor",
+        "header",
+        "app store",
+        "google play",
+        "download",
+        "qr",
+    }
 )
 
 
@@ -1426,14 +1463,16 @@ Excerpt: {article_excerpt}"""
 
         Format: article body text (truncated to 2000 chars), then a blank line,
         then ``---`` separator, then image URLs one per line prefixed with ``Image: ``.
-        If no images, just the article text. If no text, just the image URLs.
+        When article text is empty, uses a fallback placeholder string.
         """
-        text = (article.get("text") or "").strip()
+        text = _sanitize_article_text(article.get("text") or "")
         images = article.get("images", [])
 
         parts = []
         if text:
             parts.append(text[:2000])
+        else:
+            parts.append("(article text not available)")
         if images:
             if parts:
                 parts.append("")
