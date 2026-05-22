@@ -1079,7 +1079,9 @@ Select only the indices of relevant editorial content images."""
         )
 
         if result is None:
-            logger.debug("  Image LLM verification failed, keeping all pattern-filtered images")
+            logger.debug(
+                "  Image LLM verification failed, keeping all pattern-filtered images"
+            )
             return images
 
         indices = result.get("relevant_indices", [])
