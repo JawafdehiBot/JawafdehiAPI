@@ -208,6 +208,9 @@ def _filter_content_images(images: list[dict]) -> list[dict]:
     filtered = []
     for img in images:
         url = img.get("url", "")
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.scheme not in {"http", "https"}:
+            continue
         alt = (img.get("alt", "") or "").lower().strip()
 
         if any(w in alt for w in _IMAGE_ALT_BLOCKLIST):
@@ -701,7 +704,7 @@ class NewsEnricher:
         }
 
         case_linked_urls = self._get_case_linked_urls(case)
-        global_existing_urls, self._existing_url_map = self._get_existing_url_metadata()
+        _, self._existing_url_map = self._get_existing_url_metadata()
 
         queries = _generate_query_variations(case)
         if not queries:
@@ -723,7 +726,7 @@ class NewsEnricher:
         all_candidates = self._search_candidates(queries, stats)
 
         new_candidates, already_linked = self._filter_case_candidates(
-            all_candidates, case_linked_urls, global_existing_urls, force
+            all_candidates, case_linked_urls, force
         )
 
         if already_linked > 0:
@@ -983,7 +986,6 @@ class NewsEnricher:
         self,
         all_candidates: list[dict],
         case_linked_urls: set[str],
-        global_existing_urls: set[str],
         force: bool,
     ) -> tuple[list[dict], int]:
         """Split candidates into new vs already-linked.
