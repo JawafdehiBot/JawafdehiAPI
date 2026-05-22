@@ -1,5 +1,6 @@
 """Service for searching and enriching CIAA cases with news articles."""
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -813,13 +814,31 @@ class NewsEnricher:
         return stats
 
     def _search_candidates(self, queries: list[str], stats: dict) -> list[dict]:
-        """Execute search queries and collect deduplicated candidate results."""
+        """Execute search queries in parallel and collect deduplicated results."""
         all_candidates = []
         seen_urls = set()
-        for query in queries:
+
+        def _search_one(query: str) -> list[dict]:
             try:
                 results = _search_duckduckgo(query)
+                time.sleep(self.search_delay)
+                return results
+            except Exception as exc:
+                logger.warning("  Search error for '%s': %s", query[:60], exc)
+                stats["errors"] += 1
+                return []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_query = {executor.submit(_search_one, q): q for q in queries}
+            for future in concurrent.futures.as_completed(future_to_query):
+                query = future_to_query[future]
                 stats["searched"] += 1
+                try:
+                    results = future.result()
+                except Exception as exc:
+                    logger.warning("  Search error for '%s': %s", query[:60], exc)
+                    stats["errors"] += 1
+                    continue
                 new_count = 0
                 for r in results:
                     url = r["url"]
@@ -833,10 +852,6 @@ class NewsEnricher:
                     len(results),
                     new_count,
                 )
-                time.sleep(self.search_delay)
-            except Exception as exc:
-                logger.warning("  Search error for '%s': %s", query[:60], exc)
-                stats["errors"] += 1
 
         logger.info(
             "  Found %d candidate URLs from %d queries",
@@ -853,101 +868,139 @@ class NewsEnricher:
         stats: dict,
         press_release_text: Optional[str] = None,
     ) -> list[dict]:
-        """Fetch and verify candidate articles, returning accepted articles."""
+        """Fetch candidate articles in parallel, then verify with LLM sequentially."""
+        fetched = self._fetch_candidates_parallel(candidates, stats)
+
         accepted = []
-        for candidate in candidates:
+        for result in fetched:
+            if result is None:
+                continue
             if len(accepted) >= self.max_articles_per_case:
                 break
-            result = self._process_candidate(
-                candidate, case, api_key, stats, press_release_text
+
+            verified = self._verify_candidate(
+                result, case, api_key, stats, press_release_text
             )
-            if result:
-                accepted.append(result)
+            if verified:
+                accepted.append(verified)
                 stats["accepted"] += 1
                 logger.info(
                     "  Accepted: %s (confidence: %s)",
-                    candidate["url"][:80],
-                    result["confidence"],
+                    result["candidate"]["url"][:80],
+                    verified["confidence"],
                 )
         return accepted
 
-    def _process_candidate(
+    def _fetch_candidates_parallel(
         self,
-        candidate: dict,
+        candidates: list[dict],
+        stats: dict,
+    ) -> list[Optional[dict]]:
+        """Fetch candidate articles in parallel using ThreadPoolExecutor."""
+
+        def _fetch_one(candidate: dict) -> Optional[dict]:
+            url = candidate["url"]
+            if _is_official_press_release(url):
+                logger.debug("  skipped: official CIAA press release — %s", url[:80])
+                return None
+            blocklist_reason = _is_url_blocklisted(url)
+            if blocklist_reason:
+                logger.debug("  skipped: %s — %s", blocklist_reason, url[:80])
+                return None
+            try:
+                html = _fetch_article_content(url)
+                time.sleep(self.fetch_delay)
+                if not html:
+                    logger.debug("  Failed to fetch content: %s", url)
+                    return None
+                article_text = _extract_text_from_html(html)
+                if len(article_text) < 100:
+                    logger.debug(
+                        "  Insufficient content from %s (%d chars)",
+                        url,
+                        len(article_text),
+                    )
+                    return None
+                article_title = _extract_title_from_html(html) or candidate.get(
+                    "title", ""
+                )
+                images = _extract_images_from_html(html, base_url=url)[:5]
+                article_date = _extract_publication_date(html)
+                stats["fetched"] += 1
+                return {
+                    "candidate": candidate,
+                    "html": html,
+                    "article_text": article_text,
+                    "article_title": article_title,
+                    "images": images,
+                    "article_date": article_date,
+                }
+            except Exception as exc:
+                exc_type = type(exc).__name__
+                logger.warning("  fetch error: %s — %s: %s", exc_type, url[:80], exc)
+                stats["errors"] += 1
+                return None
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_candidate = {
+                executor.submit(_fetch_one, c): c for c in candidates
+            }
+            for future in concurrent.futures.as_completed(future_to_candidate):
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logger.warning("  Unhandled fetch error: %s", exc)
+                    stats["errors"] += 1
+                    result = None
+                results.append(result)
+        return results
+
+    def _verify_candidate(
+        self,
+        fetch_result: dict,
         case: Case,
         api_key: Optional[str],
         stats: dict,
         press_release_text: Optional[str] = None,
     ) -> Optional[dict]:
-        """Process a single candidate article. Returns accepted article dict or None."""
+        """Run LLM verification on a single fetched article. Returns accepted dict or None."""
+        candidate = fetch_result["candidate"]
         url = candidate["url"]
+        article_text = fetch_result["article_text"]
+        article_title = fetch_result["article_title"]
 
-        if _is_official_press_release(url):
-            logger.info("  skipped: official CIAA press release — %s", url[:80])
-            return None
+        if api_key and self.llm_base_url:
+            is_relevant, confidence, reason = self._verify_article_relevance(
+                case=case,
+                article_title=article_title,
+                article_url=url,
+                article_excerpt=article_text[:3000],
+                api_key=api_key,
+                press_release_text=press_release_text,
+            )
+        else:
+            is_relevant = False
+            confidence = "none"
+            reason = "LLM not configured"
 
-        blocklist_reason = _is_url_blocklisted(url)
-        if blocklist_reason:
-            logger.info("  skipped: %s — %s", blocklist_reason, url[:80])
-            return None
-
-        stats["fetched"] += 1
-        try:
-            html = _fetch_article_content(url)
-            if not html:
-                logger.debug("  Failed to fetch content: %s", url)
-                return None
-
-            article_text = _extract_text_from_html(html)
-            if len(article_text) < 100:
-                logger.debug(
-                    "  Insufficient content from %s (%d chars)", url, len(article_text)
-                )
-                return None
-
-            article_title = _extract_title_from_html(html) or candidate.get("title", "")
-            article_excerpt = article_text[:2000]
-
-            if api_key and self.llm_base_url:
-                is_relevant, confidence, reason = self._verify_article_relevance(
-                    case=case,
-                    article_title=article_title,
-                    article_url=url,
-                    article_excerpt=article_excerpt[:3000],
-                    api_key=api_key,
-                    press_release_text=press_release_text,
-                )
+        if not is_relevant:
+            stats["rejected"] += 1
+            if self.verbose:
+                logger.info("  rejected: %s — %s", url[:80], reason)
             else:
-                is_relevant = False
-                confidence = "none"
-                reason = "LLM not configured"
-
-            if not is_relevant:
-                stats["rejected"] += 1
-                if self.verbose:
-                    logger.info("  rejected: %s — %s", url[:80], reason)
-                else:
-                    logger.debug("  rejected: %s — %s", url[:80], reason)
-                return None
-
-            images = _extract_images_from_html(html, base_url=url)[:5]
-            article_date = _extract_publication_date(html)
-            return {
-                "title": article_title,
-                "url": url,
-                "text": article_text,
-                "images": images,
-                "publication_date": article_date,
-                "confidence": confidence,
-                "reason": reason,
-            }
-        except Exception as exc:
-            exc_type = type(exc).__name__
-            logger.warning("  error: %s — %s: %s", exc_type, url[:80], exc)
-            stats["errors"] += 1
+                logger.debug("  rejected: %s — %s", url[:80], reason)
             return None
-        finally:
-            time.sleep(self.fetch_delay)
+
+        return {
+            "title": article_title,
+            "url": url,
+            "text": article_text,
+            "images": fetch_result["images"],
+            "publication_date": fetch_result.get("article_date"),
+            "confidence": confidence,
+            "reason": reason,
+        }
 
     @staticmethod
     def _extract_urls_from_source(source: DocumentSource) -> list[str]:
