@@ -1347,7 +1347,9 @@ Excerpt: {article_excerpt}"""
                         existing_source_ids.add(existing_source_id)
                     continue
 
-                source = self._create_document_source(article)
+                source = self._create_document_source(
+                    article, fallback_date=case.case_start_date
+                )
                 url_to_source[url] = source.source_id
                 new_count += 1
 
@@ -1365,15 +1367,19 @@ Excerpt: {article_excerpt}"""
 
         return new_count
 
-    def _create_document_source(self, article: dict) -> DocumentSource:
+    def _create_document_source(
+        self, article: dict, fallback_date: Optional[date] = None
+    ) -> DocumentSource:
         """Create a DocumentSource record for an accepted news article."""
         description = self._build_source_description(article)
+        pub_date = article.get("publication_date") or fallback_date or date.today()
 
         source = DocumentSource(
             title=article["title"] or "Untitled News Article",
             description=description,
             source_type=SourceType.MEDIA_NEWS,
             url=[article["url"]],
+            publication_date=pub_date,
         )
         source.save()
         return source
