@@ -1389,16 +1389,13 @@ Excerpt: {article_excerpt}"""
         return source
 
     def _build_source_description(self, article: dict) -> str:
-        """Build description containing only filtered image URLs."""
+        """Build description containing only filtered image URLs as a JSON array."""
         images = article.get("images", [])
         if not images:
-            return ""
+            return "[]"
 
-        parts = ["Images:"]
-        for img in images[:10]:
-            parts.append(f"- {img['url']}")
-
-        return "\n".join(parts)
+        urls = [img["url"] for img in images[:10]]
+        return json.dumps(urls, ensure_ascii=False)
 
     def _build_evidence_description(self, article: dict) -> str:
         """Build evidence entry description in Nepali."""
