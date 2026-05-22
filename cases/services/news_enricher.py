@@ -1508,14 +1508,6 @@ def _guess_outlet(url: str) -> str:
         return "Unknown"
 
 
-def _summarize_for_description(article: dict) -> str:
-    """Create a one-line summary from article data."""
-    title = article.get("title", "")
-    if title:
-        return title[:150]
-    return ""
-
-
 def _parse_date_string(date_str: str) -> Optional[date]:
     """Try to parse a date string using common formats. Returns date or None."""
     date_str = date_str[:19]
