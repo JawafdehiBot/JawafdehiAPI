@@ -553,8 +553,9 @@ def _call_llm(
     base_url: str,
     api_key: str,
     timeout: int = 60,
+    max_retries: int = 3,
 ) -> Optional[dict]:
-    """Call LLM API and return parsed JSON response."""
+    """Call LLM API with exponential backoff retry and return parsed JSON response."""
     url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -569,10 +570,32 @@ def _call_llm(
         "temperature": 0.1,
         "max_tokens": 800,
     }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
+
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                delay = 2 ** attempt
+                logger.warning(
+                    "LLM call attempt %d/%d failed: %s — retrying in %ds",
+                    attempt, max_retries, exc, delay,
+                )
+                time.sleep(delay)
+                continue
+            logger.warning(
+                "LLM call failed after %d attempts: %s", max_retries, last_exc
+            )
+            return None
+
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as exc:
+            logger.warning("LLM response JSON decode failed: %s", exc)
+            return None
 
         if _detect_truncated_response(data):
             logger.warning(
@@ -592,9 +615,8 @@ def _call_llm(
             logger.debug("LLM JSON parse failed; raw content: %s", content[:500])
             return _fallback_parse_relevance(content)
         return result
-    except (requests.RequestException, json.JSONDecodeError) as exc:
-        logger.warning("LLM call failed: %s", exc)
-        return None
+
+    return None
 
 
 def _parse_llm_json(text: str) -> Optional[dict]:
@@ -868,14 +890,7 @@ class NewsEnricher:
                     logger.debug("  rejected: %s — %s", url[:80], reason)
                 return None
 
-            images = _extract_images_from_html(html, base_url=url)
-            if api_key and self.llm_base_url and images:
-                images = self._verify_images_relevance(
-                    images=images,
-                    article_title=article_title,
-                    article_url=url,
-                    api_key=api_key,
-                )
+            images = _extract_images_from_html(html, base_url=url)[:5]
             article_date = _extract_publication_date(html)
             return {
                 "title": article_title,
@@ -1022,83 +1037,6 @@ class NewsEnricher:
             for a in accepted:
                 logger.info("    - %s", a["url"][:80])
         return 0
-
-    def _verify_images_relevance(
-        self,
-        images: list[dict],
-        article_title: str,
-        article_url: str,
-        api_key: str,
-    ) -> list[dict]:
-        """Use LLM to verify which images are relevant editorial content.
-
-        Returns only images that the LLM identifies as relevant content photos.
-        """
-        if len(images) <= 3:
-            return images
-
-        image_entries = []
-        for i, img in enumerate(images[:15]):
-            alt = img.get("alt", "") or ""
-            image_entries.append(f"{i}: {img['url']}" + (f" [{alt}]" if alt else ""))
-
-        batch_text = "\n".join(image_entries)
-
-        system_prompt = """\
-You are an image selection assistant for a news article verification system.
-Given a list of candidate image URLs with optional alt-text, select ONLY the
-images that are likely to be editorial content photographs relevant to the
-news article.
-
-EXCLUDE logos, icons, banners, advertisements, generic UI elements, social
-media icons, and unrelated stock images.
-
-Return ONLY a JSON object with the field "relevant_indices" containing a list
-of integer indices of the relevant images:
-
-{"relevant_indices": [3, 6]}
-
-If no images are relevant: {"relevant_indices": []}
-"""
-
-        user_prompt = f"""Article: {article_title}
-URL: {article_url}
-
-Candidate images:
-{batch_text}
-
-Select only the indices of relevant editorial content images."""
-
-        result = _call_llm(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            model=self.llm_model,
-            base_url=self.llm_base_url,
-            api_key=api_key,
-            timeout=30,
-        )
-
-        if result is None:
-            logger.debug(
-                "  Image LLM verification failed, keeping all pattern-filtered images"
-            )
-            return images
-
-        indices = result.get("relevant_indices", [])
-        if not isinstance(indices, list):
-            return images
-
-        relevant = []
-        for idx in indices:
-            if isinstance(idx, int) and 0 <= idx < len(images):
-                relevant.append(images[idx])
-
-        logger.debug(
-            "  Image LLM verification: %d → %d relevant",
-            len(images),
-            len(relevant),
-        )
-        return relevant if relevant else images
 
     def _verify_article_relevance(
         self,
@@ -1475,13 +1413,26 @@ Excerpt: {article_excerpt}"""
         return source
 
     def _build_source_description(self, article: dict) -> str:
-        """Build description containing only filtered image URLs as a JSON array."""
-        images = article.get("images", [])
-        if not images:
-            return "[]"
+        """Build description with article text and image URLs.
 
-        urls = [img["url"] for img in images[:10]]
-        return json.dumps(urls, ensure_ascii=False)
+        Format: article body text (truncated to 2000 chars), then a blank line,
+        then ``---`` separator, then image URLs one per line prefixed with ``Image: ``.
+        If no images, just the article text. If no text, just the image URLs.
+        """
+        text = (article.get("text") or "").strip()
+        images = article.get("images", [])
+
+        parts = []
+        if text:
+            parts.append(text[:2000])
+        if images:
+            if parts:
+                parts.append("")
+                parts.append("---")
+            for img in images[:10]:
+                parts.append(f"Image: {img['url']}")
+
+        return "\n".join(parts)
 
     def _build_evidence_description(self, article: dict) -> str:
         """Build evidence entry description in Nepali."""
