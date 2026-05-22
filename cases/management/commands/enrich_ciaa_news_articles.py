@@ -174,13 +174,14 @@ class Command(BaseCommand):
         fmt = logging.Formatter("%(levelname)s: %(message)s")
         for name in _LOGGERS_TO_OVERRIDE:
             child_logger = logging.getLogger(name)
-            if not child_logger.handlers:
-                handler = logging.StreamHandler(self.stdout)
-                handler.setFormatter(fmt)
-                child_logger.addHandler(handler)
+            child_logger.handlers.clear()
+            handler = logging.StreamHandler(self.stdout)
+            handler.setFormatter(fmt)
+            child_logger.addHandler(handler)
             child_logger.propagate = False
-            if logger.isEnabledFor(logging.DEBUG):
-                child_logger.setLevel(logging.DEBUG)
+            child_logger.setLevel(
+                logging.DEBUG if logger.isEnabledFor(logging.DEBUG) else logging.INFO
+            )
 
     def handle(self, *args, **options):
         dry_run = options["dry_run"]

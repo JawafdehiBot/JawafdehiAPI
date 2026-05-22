@@ -463,7 +463,14 @@ def _resolve_llm_content(data: dict) -> Optional[str]:
     choice = choices[0] if isinstance(choices[0], dict) else {}
     message = choice.get("message", {}) if isinstance(choice, dict) else {}
     content = message.get("content") if isinstance(message, dict) else None
-    if content is not None:
+    if isinstance(content, list):
+        text_parts = [
+            part.get("text")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+        return "\n".join(text_parts) if text_parts else None
+    if isinstance(content, str):
         return content
     content = choice.get("text") if isinstance(choice, dict) else None
     if content is not None:
@@ -937,14 +944,17 @@ class NewsEnricher:
         global_existing_urls: set[str],
         force: bool,
     ) -> tuple[list[dict], int]:
-        """Split candidates into new vs already-linked."""
+        """Split candidates into new vs already-linked.
+
+        Only URLs already in this case's evidence are counted as already-linked.
+        URLs that exist globally but aren't linked to this case are processed
+        so the existing DocumentSource can be attached to this case's evidence.
+        """
         new_candidates = []
         already_linked = 0
         for c in all_candidates:
             url = c["url"]
             if url in case_linked_urls:
-                already_linked += 1
-            elif not force and url in global_existing_urls:
                 already_linked += 1
             else:
                 new_candidates.append(c)
