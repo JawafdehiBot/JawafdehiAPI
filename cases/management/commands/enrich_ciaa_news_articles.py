@@ -15,7 +15,6 @@ Usage::
 
 import logging
 import os
-import sys
 
 from django.core.management.base import BaseCommand
 
@@ -23,12 +22,6 @@ from cases.models import Case, CaseType, CaseState
 from cases.services.news_enricher import NewsEnricher, enrich_cases_batch
 from cases.services.priority_case_loader import filter_by_priority, load_priority_cases
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s: %(message)s",
-    stream=sys.stdout,
-    force=True,
-)
 logger = logging.getLogger(__name__)
 
 _LOGGERS_TO_OVERRIDE = (
