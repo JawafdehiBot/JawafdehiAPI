@@ -869,6 +869,13 @@ class NewsEnricher:
                 return None
 
             images = _extract_images_from_html(html, base_url=url)
+            if api_key and self.llm_base_url and images:
+                images = self._verify_images_relevance(
+                    images=images,
+                    article_title=article_title,
+                    article_url=url,
+                    api_key=api_key,
+                )
             article_date = _extract_publication_date(html)
             return {
                 "title": article_title,
@@ -1015,6 +1022,81 @@ class NewsEnricher:
             for a in accepted:
                 logger.info("    - %s", a["url"][:80])
         return 0
+
+    def _verify_images_relevance(
+        self,
+        images: list[dict],
+        article_title: str,
+        article_url: str,
+        api_key: str,
+    ) -> list[dict]:
+        """Use LLM to verify which images are relevant editorial content.
+
+        Returns only images that the LLM identifies as relevant content photos.
+        """
+        if len(images) <= 3:
+            return images
+
+        image_entries = []
+        for i, img in enumerate(images[:15]):
+            alt = img.get("alt", "") or ""
+            image_entries.append(f"{i}: {img['url']}" + (f" [{alt}]" if alt else ""))
+
+        batch_text = "\n".join(image_entries)
+
+        system_prompt = """\
+You are an image selection assistant for a news article verification system.
+Given a list of candidate image URLs with optional alt-text, select ONLY the
+images that are likely to be editorial content photographs relevant to the
+news article.
+
+EXCLUDE logos, icons, banners, advertisements, generic UI elements, social
+media icons, and unrelated stock images.
+
+Return ONLY a JSON object with the field "relevant_indices" containing a list
+of integer indices of the relevant images:
+
+{"relevant_indices": [3, 6]}
+
+If no images are relevant: {"relevant_indices": []}
+"""
+
+        user_prompt = f"""Article: {article_title}
+URL: {article_url}
+
+Candidate images:
+{batch_text}
+
+Select only the indices of relevant editorial content images."""
+
+        result = _call_llm(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=self.llm_model,
+            base_url=self.llm_base_url,
+            api_key=api_key,
+            timeout=30,
+        )
+
+        if result is None:
+            logger.debug("  Image LLM verification failed, keeping all pattern-filtered images")
+            return images
+
+        indices = result.get("relevant_indices", [])
+        if not isinstance(indices, list):
+            return images
+
+        relevant = []
+        for idx in indices:
+            if isinstance(idx, int) and 0 <= idx < len(images):
+                relevant.append(images[idx])
+
+        logger.debug(
+            "  Image LLM verification: %d → %d relevant",
+            len(images),
+            len(relevant),
+        )
+        return relevant if relevant else images
 
     def _verify_article_relevance(
         self,
