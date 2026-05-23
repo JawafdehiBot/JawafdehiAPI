@@ -14,7 +14,7 @@ from typing import Optional
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
-from django.db import transaction
+from django.db import close_old_connections, transaction
 
 from cases.models import Case, DocumentSource, SourceType
 
@@ -1036,6 +1036,7 @@ class NewsEnricher:
                         url_map[u] = source.source_id
         except Exception:
             logger.exception("Failed to load URL-to-source map")
+            close_old_connections()
         return url_map
 
     def _index_source_url(
@@ -1061,6 +1062,7 @@ class NewsEnricher:
                 self._index_source_url(urls, url_map, source)
         except Exception:
             logger.exception("Failed to load existing URL metadata")
+            close_old_connections()
         return urls, url_map
 
     def _get_case_linked_urls(self, case: Case) -> set[str]:
@@ -1078,6 +1080,7 @@ class NewsEnricher:
                 linked_urls.update(self._extract_urls_from_source(source))
         except Exception:
             logger.exception("Failed to fetch linked URLs for case")
+            close_old_connections()
         return linked_urls
 
     def _log_case_progress(
@@ -1628,6 +1631,7 @@ def enrich_cases_batch(
     total = len(cases_list)
 
     for idx, case in enumerate(cases_list, 1):
+        close_old_connections()
         stats["total"] += 1
         try:
             result = enricher.enrich_case(
