@@ -54,24 +54,6 @@ _NON_NEWS_DOMAIN_PATTERNS = (
     re.compile(r"^https?://(?:[a-z-]+\.)?facebook\.com/", re.IGNORECASE),
 )
 
-_NEWS_DOMAIN_PATTERNS = (
-    "gorkhapatraonline",
-    "surakshyanews",
-    "ekantipur",
-    "onlinekhabar",
-    "setopati",
-    "ratopati",
-    "nagariknews",
-    "nepalnews",
-    "myrepublica",
-    "kathmandupost",
-    "himalayantimes",
-    "nepalkhabar",
-    "annapurnapost",
-    "nayapatrikadaily",
-    "ujyaaloonline",
-)
-
 
 def _is_official_press_release(url: str) -> bool:
     """Check if a URL is an official CIAA press release page (not third-party news)."""
@@ -868,27 +850,49 @@ class NewsEnricher:
         stats: dict,
         press_release_text: Optional[str] = None,
     ) -> list[dict]:
-        """Fetch candidate articles in parallel, then verify with LLM sequentially."""
-        fetched = self._fetch_candidates_parallel(candidates, stats)
+        """Fetch candidate articles in parallel, then verify with LLM in parallel."""
+        fetched = [
+            r
+            for r in self._fetch_candidates_parallel(candidates, stats)
+            if r is not None
+        ]
+
+        if not fetched:
+            return []
 
         accepted = []
-        for result in fetched:
-            if result is None:
-                continue
-            if len(accepted) >= self.max_articles_per_case:
-                break
-
-            verified = self._verify_candidate(
-                result, case, api_key, stats, press_release_text
-            )
-            if verified:
-                accepted.append(verified)
-                stats["accepted"] += 1
-                logger.info(
-                    "  Accepted: %s (confidence: %s)",
-                    result["candidate"]["url"][:80],
-                    verified["confidence"],
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_result = {}
+            for result in fetched:
+                future = executor.submit(
+                    self._verify_candidate,
+                    result,
+                    case,
+                    api_key,
+                    stats,
+                    press_release_text,
                 )
+                future_to_result[future] = result
+
+            for future in concurrent.futures.as_completed(future_to_result):
+                if len(accepted) >= self.max_articles_per_case:
+                    for f in future_to_result:
+                        f.cancel()
+                    break
+                try:
+                    verified = future.result()
+                except Exception as exc:
+                    logger.warning("  LLM verify error: %s", exc)
+                    stats["errors"] += 1
+                    continue
+                if verified:
+                    accepted.append(verified)
+                    stats["accepted"] += 1
+                    logger.info(
+                        "  Accepted: %s (confidence: %s)",
+                        verified["url"][:80],
+                        verified["confidence"],
+                    )
         return accepted
 
     def _fetch_candidates_parallel(
@@ -1019,10 +1023,6 @@ class NewsEnricher:
             for entry in evidence
             if isinstance(entry, dict) and entry.get("source_id")
         }
-
-    def _get_existing_article_urls(self) -> set[str]:
-        """Get set of article URLs already stored as DocumentSource."""
-        return set(self._get_url_to_source_map().keys())
 
     def _get_url_to_source_map(self) -> dict[str, str]:
         """Get mapping from URL to source_id for existing MEDIA_NEWS sources."""
