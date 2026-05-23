@@ -257,14 +257,36 @@ def _extract_title_from_html(html: str) -> str:
 def _search_duckduckgo(query: str, timeout: int = 15) -> list[dict]:
     """Search DuckDuckGo HTML and return list of result dicts.
 
+    Retries with exponential backoff on 403/429 responses.
     Returns list of dicts with keys: title, url, snippet.
     """
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-    try:
-        resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("DuckDuckGo search failed for query '%s': %s", query[:60], exc)
+    backoff_delays = (5, 15, 45)
+    for attempt, delay in enumerate(backoff_delays, 1):
+        try:
+            resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+            if resp.status_code in (403, 429):
+                logger.warning(
+                    "DDG search attempt %d/%d: HTTP %d for '%s' — retrying in %ds",
+                    attempt,
+                    len(backoff_delays),
+                    resp.status_code,
+                    query[:60],
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("DuckDuckGo search failed for query '%s': %s", query[:60], exc)
+            return []
+        break  # success → exit loop, skip else
+    else:
+        logger.warning(
+            "DuckDuckGo search failed after %d attempts for '%s'",
+            len(backoff_delays),
+            query[:60],
+        )
         return []
 
     html = _truncate_for_regex(resp.text)
@@ -979,7 +1001,7 @@ class NewsEnricher:
                 case=case,
                 article_title=article_title,
                 article_url=url,
-                article_excerpt=article_text[:3000],
+                article_excerpt=article_text[:1500],
                 api_key=api_key,
                 press_release_text=press_release_text,
             )
@@ -1164,7 +1186,7 @@ Key Allegations: {', '.join(case.key_allegations[:5]) if case.key_allegations el
             case_context += f"""
 
 Press Release Text (official CIAA document):
-{press_release_text[:1000]}"""
+{press_release_text[:700]}"""
         else:
             case_context += """
 
