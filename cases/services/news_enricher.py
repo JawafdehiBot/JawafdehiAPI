@@ -278,7 +278,9 @@ def _search_duckduckgo(query: str, timeout: int = 15) -> list[dict]:
                 continue
             resp.raise_for_status()
         except requests.RequestException as exc:
-            logger.warning("DuckDuckGo search failed for query '%s': %s", query[:60], exc)
+            logger.warning(
+                "DuckDuckGo search failed for query '%s': %s", query[:60], exc
+            )
             return []
         break  # success → exit loop, skip else
     else:
