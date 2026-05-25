@@ -737,7 +737,7 @@ def _collect_case_text(case: Case) -> str:
 
 
 def _collect_evidence_text(case: Case) -> str:  # noqa
-    """Build a text blob from evidence entries, using actual file content when available.
+    """Build a search corpus from evidence entries and source document files."""
 
     Priority:
     1. DocumentSource uploaded_file content (converted via MarkItDown)
@@ -783,7 +783,7 @@ def _collect_evidence_text(case: Case) -> str:  # noqa
     all_count = len(source_ids)
     hv_count = high_value.count()
     logger.info(
-        f"  Found {hv_count}/{all_count} high-value sources (press releases, court orders)"
+        f"  Found {hv_count}/{all_count} high-value sources"
     )
 
     sources = list(high_value) + list(other)
@@ -946,13 +946,14 @@ def _convert_urls(src: DocumentSource) -> str:  # noqa
                     content_length = resp.headers.get("Content-Length")
                     if content_length and int(content_length) > _MAX_DOWNLOAD_BYTES:
                         logger.debug(
-                            f"Skipping {url}: Content-Length {content_length} > {_MAX_DOWNLOAD_BYTES}"
+                            f"Skipping {url}: too large"
+                            f" ({content_length} > {_MAX_DOWNLOAD_BYTES})"
                         )
                         continue
                     data = resp.read(_MAX_DOWNLOAD_BYTES + 1)
                     if len(data) > _MAX_DOWNLOAD_BYTES:
                         logger.debug(
-                            f"Skipping {url}: download exceeds {_MAX_DOWNLOAD_BYTES} bytes"
+                            f"Skipping {url}: >{_MAX_DOWNLOAD_BYTES} bytes"
                         )
                         continue
                     with open(tmp_path, "wb") as f:
@@ -1064,7 +1065,8 @@ def _build_tag_selection_instructions() -> list[str]:
     lines.append("")
     lines.append("Return ONLY a JSON array of tag strings, nothing else.")
     lines.append(
-        'Example: ["CIAA", "Corruption", "Local Government", "Bribery", "Kathmandu Valley"]'
+        'Example: ["CIAA", "Corruption", "Local Government", '
+        '"Bribery", "Kathmandu Valley"]'
     )
     return lines
 
@@ -1104,7 +1106,8 @@ def build_llm_classification_prompt(case: Case) -> str:
     """Build a prompt for LLM-based tag classification from case metadata."""
     lines = []
     lines.append(
-        "Classify the following Nepal corruption case with tags from the controlled vocabulary below."
+        "Classify the following Nepal corruption case with tags "
+        "from the controlled vocabulary below."
     )
     lines.append("")
     lines.append(f"Case Title: {case.title}")
@@ -1128,10 +1131,12 @@ def build_llm_classification_prompt_from_sources(case: Case, evidence_text: str)
     """Build a prompt for LLM-based tag classification using source documents."""
     lines = []
     lines.append(
-        "Classify the following Nepal corruption case with tags from the controlled vocabulary below."
+        "Classify the following Nepal corruption case with tags "
+        "from the controlled vocabulary below."
     )
     lines.append(
-        "Use the source documents (press releases, court orders) as the primary evidence."
+        "Use the source documents (press releases, court orders) "
+        "as the primary evidence."
     )
     lines.append("")
     lines.append(f"Case Title: {case.title}")
@@ -1198,7 +1203,7 @@ def validate_tags(tags: list[str]) -> list[str]:
 
 
 class TagEnricher:
-    """Service for enriching CIAA cases with tags via source documents + rule-based + LLM classification.
+    """Service for enriching CIAA cases with tags via source docs + rules + LLM."""
 
     Three-tier pipeline per case:
     1. Primary: LLM classification from source documents (evidence + DocumentSource)
@@ -1226,7 +1231,10 @@ class TagEnricher:
 
         def _call() -> str:
             if self._llm_client is not None:
-                logger.debug("  Using CLI-provided LLM client (bypassing DB LLMProvider)")
+                logger.debug(
+                    "  Using CLI-provided LLM client "
+                    "(bypassing DB LLMProvider)"
+                )
                 response = self._llm_client.invoke(prompt)
                 if hasattr(response, "content"):
                     return response.content
@@ -1242,7 +1250,9 @@ class TagEnricher:
             return self._llm_service._call_llm(llm, prompt)
 
         try:
-            result = retry_with_backoff(_call, max_retries=3, base_seconds=1.0, max_seconds=30.0)
+            result = retry_with_backoff(
+                _call, max_retries=3, base_seconds=1.0, max_seconds=30.0
+            )
             record_llm_outcome(True, model=self._model, command=circuit_name)
             return result
         except Exception:
@@ -1265,7 +1275,9 @@ class TagEnricher:
         if case_num and total_cases:
             case_num_str = f" (#{case_number})" if case_number else ""
             logger.info(
-                f"[{case_num}/{total_cases}] Processing {case.case_id}{case_num_str} — {case.title[:70] if case.title else 'No title'}"
+                f"[{case_num}/{total_cases}] Processing "
+                f"{case.case_id}{case_num_str} — "
+                f"{case.title[:70] if case.title else 'No title'}"
             )
         else:
             logger.info(f"Processing {case.case_id}...")
@@ -1337,7 +1349,9 @@ class TagEnricher:
         llm_invoked = False
         llm_contributed = False
         if self.use_llm and len(tags) < 5:
-            with track_pipeline_duration(tier="metadata_llm", command="enrich_ciaa_tags"):
+            with track_pipeline_duration(
+                tier="metadata_llm", command="enrich_ciaa_tags"
+            ):
                 logger.info("  Attempting metadata_llm classification...")
                 llm_invoked = True
                 try:
@@ -1349,7 +1363,10 @@ class TagEnricher:
                         logger.info(f"  + metadata_llm succeeded: {len(all_tags)} tags")
                     else:
                         all_tags = tags
-                        logger.info("  - metadata_llm returned no tags, using rule-based")
+                        logger.info(
+                            "  - metadata_llm returned no tags, "
+                            "using rule-based"
+                        )
                 except Exception as e:
                     logger.warning(f"  - metadata_llm failed: {str(e)[:120]}")
                     all_tags = tags
@@ -1380,7 +1397,7 @@ class TagEnricher:
     def _classify_with_llm_from_sources(
         self, case: Case, evidence_text: str
     ) -> list[str]:
-        """Use LLM to classify a case from source documents. Returns list of tag strings."""
+        """Use LLM to classify a case from source documents. Returns tag strings."""
         prompt = build_llm_classification_prompt_from_sources(case, evidence_text)
         response = self._source_llm_cb.call(
             lambda: self._invoke_llm(prompt, circuit_name="source_llm")

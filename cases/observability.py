@@ -30,7 +30,9 @@ class _Histogram:
     name: str
     help: str
     labelnames: list[str] = field(default_factory=list)
-    _buckets: list[float] = field(default_factory=lambda: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300])
+    _buckets: list[float] = field(
+        default_factory=lambda: [0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
+    )
     _sum: float = 0.0
     _count: int = 0
     _bucket_counts: dict[str, int] = field(default_factory=dict)
@@ -48,7 +50,11 @@ class _Histogram:
 
     def snapshot(self) -> dict:
         with _LOCK:
-            return {"sum": self._sum, "count": self._count, "buckets": dict(self._bucket_counts)}
+            return {
+                "sum": self._sum,
+                "count": self._count,
+                "buckets": dict(self._bucket_counts),
+            }
 
 
 @dataclass
@@ -187,7 +193,10 @@ def export_textfile(path: str) -> None:
             for bucket_key, bucket_count in sorted(snap["buckets"].items()):
                 lines.append(f"{metric.name}_bucket{{{bucket_key}}} {bucket_count}")
 
-    for metric in [llm_call, cache_hit, quality_gate, likhit_failures, circuit_breaker_trips]:
+    counters = [
+        llm_call, cache_hit, quality_gate, likhit_failures, circuit_breaker_trips
+    ]
+    for metric in counters:
         snap = metric.snapshot()
         lines.append(f"# HELP {metric.name} {metric.help}")
         lines.append(f"# TYPE {metric.name} counter")
@@ -225,7 +234,9 @@ def track_pipeline_duration(tier: str, command: str = "unknown"):
         pipeline_duration.observe(elapsed, labels={"tier": tier, "command": command})
 
 
-def record_llm_outcome(success: bool, model: str = "unknown", command: str = "unknown") -> None:
+def record_llm_outcome(
+    success: bool, model: str = "unknown", command: str = "unknown"
+) -> None:
     outcome = "success" if success else "failure"
     llm_call.inc(labels={"outcome": outcome, "model": model, "command": command})
 
@@ -239,7 +250,9 @@ def record_quality_gate(gate: str, passed: bool) -> None:
 
 
 def record_confidence(section: str, confidence: float) -> None:
-    section_confidence.observe(max(0.0, min(1.0, confidence)), labels={"section": section})
+    section_confidence.observe(
+        max(0.0, min(1.0, confidence)), labels={"section": section}
+    )
 
 
 def record_likhit_failure(file_type: str = "unknown") -> None:

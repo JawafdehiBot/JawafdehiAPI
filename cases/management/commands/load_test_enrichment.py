@@ -76,10 +76,13 @@ class Command(BaseCommand):
         failed = 0
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = {
-                executor.submit(self._enrich_one, enricher, case, idx + 1, len(cases)): case
-                for idx, case in enumerate(cases)
-            }
+            futures = {}
+            for idx, case in enumerate(cases):
+                futures[
+                    executor.submit(
+                        self._enrich_one, enricher, case, idx + 1, len(cases)
+                    )
+                ] = case
             for future in as_completed(futures):
                 case = futures[future]
                 try:

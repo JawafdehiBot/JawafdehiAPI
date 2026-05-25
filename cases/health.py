@@ -48,11 +48,16 @@ def enrichment_health(request: HttpRequest) -> JsonResponse:
         "status": status,
         "checks": {
             "circuit_breaker": {"ok": circuit_ok, "trips": int(cb_snap["total"])},
-            "llm_success_rate": {"ok": llm_success_rate >= 0.9, "rate": round(llm_success_rate, 4)},
+            "llm_success_rate": {
+                "ok": llm_success_rate >= 0.9,
+                "rate": round(llm_success_rate, 4),
+            },
         },
         "metrics": {
             "pipeline_cases": pipeline_snap["count"],
-            "pipeline_avg_seconds": round(pipeline_snap["sum"] / max(1, pipeline_snap["count"]), 2),
+            "pipeline_avg_seconds": round(
+                pipeline_snap["sum"] / max(1, pipeline_snap["count"]), 2
+            ),
             "llm_calls_total": int(total_llm_calls),
             "likhit_failures_total": int(likhit_failures.snapshot()["total"]),
             "null_source_type_ratio": null_source_type.snapshot(),

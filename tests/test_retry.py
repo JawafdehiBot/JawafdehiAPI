@@ -2,7 +2,11 @@
 
 import pytest
 
-from cases.retry import retry_with_backoff, retryable_http_status, retryable_network_error
+from cases.retry import (
+    retry_with_backoff,
+    retryable_http_status,
+    retryable_network_error,
+)
 
 
 class TestRetryWithBackoff:
@@ -19,7 +23,9 @@ class TestRetryWithBackoff:
                 raise RuntimeError("transient")
             return "ok"
 
-        result = retry_with_backoff(flaky, max_retries=3, base_seconds=0.001, max_seconds=0.01, jitter=0)
+        result = retry_with_backoff(
+            flaky, max_retries=3, base_seconds=0.001, max_seconds=0.01, jitter=0
+        )
         assert result == "ok"
         assert call_count[0] == 3
 
@@ -28,7 +34,13 @@ class TestRetryWithBackoff:
             raise RuntimeError("permanent")
 
         with pytest.raises(RuntimeError, match="permanent"):
-            retry_with_backoff(always_fails, max_retries=2, base_seconds=0.001, max_seconds=0.01, jitter=0)
+            retry_with_backoff(
+                always_fails,
+                max_retries=2,
+                base_seconds=0.001,
+                max_seconds=0.01,
+                jitter=0,
+            )
 
     def test_respects_retryable_filter(self):
         def raises_value_error():
