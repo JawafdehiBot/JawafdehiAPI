@@ -1,5 +1,6 @@
 """Service for rule-based and LLM-based tag classification of CIAA cases."""
 
+import itertools
 import ipaddress
 import json
 import logging
@@ -737,7 +738,7 @@ def _collect_case_text(case: Case) -> str:
 
 
 def _collect_evidence_text(case: Case) -> str:  # noqa
-    """Build a search corpus from evidence entries and source document files."""
+    """Build a search corpus from evidence entries and source document files.
 
     Priority:
     1. DocumentSource uploaded_file content (converted via MarkItDown)
@@ -786,7 +787,7 @@ def _collect_evidence_text(case: Case) -> str:  # noqa
         f"  Found {hv_count}/{all_count} high-value sources"
     )
 
-    sources = list(high_value) + list(other)
+    sources = list(itertools.chain(high_value, other))
 
     source_ids_for_uploads = [s.id for s in sources]
     pre_fetched_uploads = {}
@@ -978,16 +979,46 @@ def _convert_urls(src: DocumentSource) -> str:  # noqa
     return ""
 
 
-def _match_keywords(text: str, keyword_map: dict[str, list[str]]) -> list[str]:  # noqa
-    """Match text against keyword maps. Returns matched tag names."""
-    matched = []
+def _precompile_keyword_map(
+    keyword_map: dict[str, list[str]],
+) -> dict[str, tuple[list[re.Pattern], list[str]]]:
+    """Precompile regex patterns for ascii keywords, non-ascii kept as literals."""
+    compiled = {}
     for tag, keywords in keyword_map.items():
+        regexes = []
+        literals = []
         for kw in keywords:
             if kw.isascii() and all(c.isascii() for c in kw):
-                if re.search(r"\b" + re.escape(kw) + r"\w*\b", text):
-                    matched.append(tag)
-                    break
+                regexes.append(re.compile(r"\b" + re.escape(kw) + r"\w*\b"))
             else:
+                literals.append(kw)
+        compiled[tag] = (regexes, literals)
+    return compiled
+
+
+# Precompile keyword maps once at module load
+_COMPILED_SECTORS = _precompile_keyword_map(SECTOR_KEYWORDS)
+_COMPILED_CORRUPTION = _precompile_keyword_map(CORRUPTION_TYPE_KEYWORDS)
+_COMPILED_REGIONS = _precompile_keyword_map(REGION_KEYWORDS)
+
+# Precompute valid tag set for validate_tags
+_VALID_TAGS = frozenset(
+    SECTOR_TAGS + CORRUPTION_TYPE_TAGS + REGION_TAGS + CONTEXT_TAGS
+)
+
+
+def _match_keywords(
+    text: str, compiled_map: dict[str, tuple[list[re.Pattern], list[str]]]
+) -> list[str]:
+    """Match text against precompiled keyword maps. Returns matched tag names."""
+    matched = []
+    for tag, (regexes, literals) in compiled_map.items():
+        for pat in regexes:
+            if pat.search(text):
+                matched.append(tag)
+                break
+        else:
+            for kw in literals:
                 if kw in text:
                     matched.append(tag)
                     break
@@ -1076,13 +1107,13 @@ def classify_case_rules(case: Case) -> list[str]:  # noqa
     text = _collect_case_text(case)
     tags = []
 
-    sectors = _match_keywords(text, SECTOR_KEYWORDS)
+    sectors = _match_keywords(text, _COMPILED_SECTORS)
     tags.extend(sectors[:3])
 
-    corruption_types = _match_keywords(text, CORRUPTION_TYPE_KEYWORDS)
+    corruption_types = _match_keywords(text, _COMPILED_CORRUPTION)
     tags.extend(corruption_types[:3])
 
-    regions = _match_keywords(text, REGION_KEYWORDS)
+    regions = _match_keywords(text, _COMPILED_REGIONS)
     tags.extend(regions[:2])
 
     amount_tier = _detect_amount_tier(case.bigo)
@@ -1182,28 +1213,18 @@ def validate_tags(tags: list[str]) -> list[str]:
 
     Amount tier tags (~X Crore Y Lakh etc.) are dynamic and always pass through.
     """
-    all_valid = set()
-    for tag_list in [
-        SECTOR_TAGS,
-        CORRUPTION_TYPE_TAGS,
-        REGION_TAGS,
-        CONTEXT_TAGS,
-    ]:
-        all_valid.update(tag_list)
-
     valid = []
     seen = set()
     for t in tags:
-        # Amount tags are dynamic (e.g. "~4 Crore 90 Lakh") — always valid
         is_amount = t.startswith("~") or t == "Under 1 Hazar"
-        if (t in all_valid or is_amount) and t not in seen:
+        if (t in _VALID_TAGS or is_amount) and t not in seen:
             seen.add(t)
             valid.append(t)
     return valid
 
 
 class TagEnricher:
-    """Service for enriching CIAA cases with tags via source docs + rules + LLM."""
+    """Service for enriching CIAA cases with tags via source docs + rules + LLM.
 
     Three-tier pipeline per case:
     1. Primary: LLM classification from source documents (evidence + DocumentSource)
