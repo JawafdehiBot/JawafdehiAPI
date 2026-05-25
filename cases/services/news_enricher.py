@@ -140,21 +140,6 @@ class _ImageExtractor(HTMLParser):
                 self.images.append({"url": full_url, "alt": alt})
 
 
-def _sanitize_article_text(text: str) -> str:
-    """Normalize article text to clean UTF-8 and strip null bytes.
-
-    Encodes to UTF-8 and decodes back with 'replace' to fix mojibake
-    (e.g. à¤à¤¾à¤¬à¤¹ from mis-handled Nepali Unicode) and strips
-    null bytes that can appear from broken HTML parsing.
-    """
-    text = text.replace("\x00", "")
-    try:
-        text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        pass
-    return text.strip()
-
-
 def _extract_text_from_html(html: str) -> str:
     """Extract visible text from HTML."""
     parser = _TextExtractor()
@@ -774,6 +759,24 @@ class NewsEnricher:
 
         case_linked_urls = self._get_case_linked_urls(case)
         _, self._existing_url_map = self._get_existing_url_metadata()
+
+        if len(case_linked_urls) >= self.max_articles_per_case and not force:
+            logger.info(
+                "  Already has %d article(s) linked (max=%d) — skipping",
+                len(case_linked_urls),
+                self.max_articles_per_case,
+            )
+            return {
+                "status": "skipped",
+                "reason": "already_saturated",
+                "searched": 0,
+                "fetched": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "errors": 0,
+                "already_linked": 0,
+                "new_sources": 0,
+            }
 
         queries = _generate_query_variations(case)
         if not queries:
@@ -1539,28 +1542,17 @@ Excerpt: {article_excerpt}"""
         return source
 
     def _build_source_description(self, article: dict) -> str:
-        """Build description with article text and image URLs.
+        """Build description with image URLs only.
 
-        Format: article body text (truncated to 2000 chars), then a blank line,
-        then ``---`` separator, then image URLs one per line prefixed with ``Image: ``.
-        When article text is empty, uses a fallback placeholder string.
+        Format: one ``Image: <url>`` line per image. No article text.
         """
-        text = _sanitize_article_text(article.get("text") or "")
         images = article.get("images", [])
 
         parts = []
-        if text:
-            parts.append(text[:2000])
-        else:
-            parts.append("(article text not available)")
-        if images:
-            if parts:
-                parts.append("")
-                parts.append("---")
-            for img in images[:10]:
-                parts.append(f"Image: {img['url']}")
+        for img in images[:10]:
+            parts.append(f"Image: {img['url']}")
 
-        return "\n".join(parts)
+        return "\n".join(parts) if parts else ""
 
     def _build_evidence_description(self, article: dict) -> str:
         """Build evidence entry description in Nepali."""
