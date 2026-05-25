@@ -25,5 +25,6 @@ urlpatterns = [
     path("statistics/", StatisticsView.as_view(), name="statistics"),
     path("feedback/", FeedbackView.as_view(), name="feedback"),
     path("oembed/", OEmbedView.as_view(), name="oembed"),
+    path("health/enrichment/", include("cases.health_urls")),
     path("", include(router.urls)),
 ]

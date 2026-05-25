@@ -1204,35 +1204,57 @@ class TagEnricher:
     1. Primary: LLM classification from source documents (evidence + DocumentSource)
     2. Fallback: Rule-based keyword matching on case metadata
     3. Default: Core tags only (CIAA, Corruption)
+
+    Includes circuit breaker protection, retry with exponential backoff,
+    and Prometheus-compatible metrics recording.
     """
 
-    def __init__(self, use_llm: bool = True, llm_client=None):
+    def __init__(self, use_llm: bool = True, llm_client=None, model: str = "unknown"):
         self.use_llm = use_llm
         self._llm_client = llm_client
         self._llm_service = None
+        self._model = model
 
-    def _invoke_llm(self, prompt: str) -> str:
-        if self._llm_client is not None:
-            logger.debug("  Using CLI-provided LLM client (bypassing DB LLMProvider)")
-            response = self._llm_client.invoke(prompt)
-            if hasattr(response, "content"):
-                return response.content
-            return str(response)
+        from cases.circuit_breaker import CircuitBreaker
 
-        if self._llm_service is None:
-            from caseworker.services import LLMService
+        self._source_llm_cb = CircuitBreaker(name="source_llm")
+        self._metadata_llm_cb = CircuitBreaker(name="metadata_llm")
 
-            self._llm_service = LLMService()
+    def _invoke_llm(self, prompt: str, circuit_name: str = "unknown") -> str:
+        from cases.observability import record_llm_outcome
+        from cases.retry import retry_with_backoff
 
-        logger.debug("  Using DB LLMProvider")
-        llm = self._llm_service.get_llm()
-        return self._llm_service._call_llm(llm, prompt)
+        def _call() -> str:
+            if self._llm_client is not None:
+                logger.debug("  Using CLI-provided LLM client (bypassing DB LLMProvider)")
+                response = self._llm_client.invoke(prompt)
+                if hasattr(response, "content"):
+                    return response.content
+                return str(response)
+
+            if self._llm_service is None:
+                from caseworker.services import LLMService
+
+                self._llm_service = LLMService()
+
+            logger.debug("  Using DB LLMProvider")
+            llm = self._llm_service.get_llm()
+            return self._llm_service._call_llm(llm, prompt)
+
+        try:
+            result = retry_with_backoff(_call, max_retries=3, base_seconds=1.0, max_seconds=30.0)
+            record_llm_outcome(True, model=self._model, command=circuit_name)
+            return result
+        except Exception:
+            record_llm_outcome(False, model=self._model, command=circuit_name)
+            raise
 
     def enrich_case(
         self, case: Case, force: bool = False, case_num: int = 0, total_cases: int = 0
     ) -> dict:  # noqa
         """Enrich a single case with tags. Returns dict with status, tags, and tier."""
-        # Extract case number from court_cases field (format: "special:080-CR-0007")
+        from cases.observability import track_pipeline_duration
+
         case_number = None
         if case.court_cases:
             for entry in case.court_cases:
@@ -1268,66 +1290,69 @@ class TagEnricher:
             evidence_text = _collect_evidence_text(case)
             has_evidence = bool(evidence_text.strip())
 
+        tier = "rule_based"
+
         if self.use_llm and has_evidence:
-            logger.info("  Attempting source_llm classification...")
-            try:
-                llm_tags = self._classify_with_llm_from_sources(case, evidence_text)
-                if llm_tags:
-                    validated = validate_tags(list(dict.fromkeys(llm_tags)))
-                    if validated:
-                        if len(validated) >= 3:
-                            all_tags = validated
+            with track_pipeline_duration(tier="source_llm", command="enrich_ciaa_tags"):
+                logger.info("  Attempting source_llm classification...")
+                try:
+                    llm_tags = self._classify_with_llm_from_sources(case, evidence_text)
+                    if llm_tags:
+                        validated = validate_tags(list(dict.fromkeys(llm_tags)))
+                        if validated:
+                            if len(validated) >= 3:
+                                all_tags = validated
+                                logger.info(
+                                    f"  + source_llm succeeded: {len(all_tags)} tags"
+                                )
+                            else:
+                                rule_tags = classify_case_rules(case)
+                                all_tags = validate_tags(
+                                    list(dict.fromkeys(validated + rule_tags))
+                                )
+                                logger.info(
+                                    f"  + source_llm augmented: {len(all_tags)} tags"
+                                )
                             logger.info(
-                                f"  + source_llm succeeded: {len(all_tags)} tags"
+                                f"+ Enriched {case.case_id} (source_llm): {all_tags}"
                             )
+                            all_tags = _append_amount_tag(all_tags, case.bigo)
+                            return {
+                                "status": "enriched",
+                                "tags": all_tags,
+                                "tier": "source_llm",
+                                "reason": "",
+                            }
                         else:
-                            rule_tags = classify_case_rules(case)
-                            all_tags = validate_tags(
-                                list(dict.fromkeys(validated + rule_tags))
+                            logger.warning(
+                                "  - source_llm returned no valid tags, falling back"
                             )
-                            logger.info(
-                                f"  + source_llm augmented: {len(all_tags)} tags"
-                            )
-                        logger.info(
-                            f"+ Enriched {case.case_id} (source_llm): {all_tags}"
-                        )
-                        # Always append bigo amount tag if available
-                        all_tags = _append_amount_tag(all_tags, case.bigo)
-                        return {
-                            "status": "enriched",
-                            "tags": all_tags,
-                            "tier": "source_llm",
-                            "reason": "",
-                        }
                     else:
-                        logger.warning(
-                            "  - source_llm returned no valid tags, falling back"
-                        )
-                else:
-                    logger.warning("  - source_llm returned no tags, falling back")
-            except Exception as e:
-                logger.warning(f"  - source_llm failed: {str(e)[:120]}")
+                        logger.warning("  - source_llm returned no tags, falling back")
+                except Exception as e:
+                    logger.warning(f"  - source_llm failed: {str(e)[:120]}")
 
         tags = classify_case_rules(case)
 
         llm_invoked = False
         llm_contributed = False
         if self.use_llm and len(tags) < 5:
-            logger.info("  Attempting metadata_llm classification...")
-            llm_invoked = True
-            try:
-                llm_tags = self._classify_with_llm(case)
-                if llm_tags:
-                    new_tags = list(dict.fromkeys(tags + llm_tags))
-                    llm_contributed = len(new_tags) > len(tags)
-                    all_tags = new_tags
-                    logger.info(f"  + metadata_llm succeeded: {len(all_tags)} tags")
-                else:
+            with track_pipeline_duration(tier="metadata_llm", command="enrich_ciaa_tags"):
+                logger.info("  Attempting metadata_llm classification...")
+                llm_invoked = True
+                try:
+                    llm_tags = self._classify_with_llm(case)
+                    if llm_tags:
+                        new_tags = list(dict.fromkeys(tags + llm_tags))
+                        llm_contributed = len(new_tags) > len(tags)
+                        all_tags = new_tags
+                        logger.info(f"  + metadata_llm succeeded: {len(all_tags)} tags")
+                    else:
+                        all_tags = tags
+                        logger.info("  - metadata_llm returned no tags, using rule-based")
+                except Exception as e:
+                    logger.warning(f"  - metadata_llm failed: {str(e)[:120]}")
                     all_tags = tags
-                    logger.info("  - metadata_llm returned no tags, using rule-based")
-            except Exception as e:
-                logger.warning(f"  - metadata_llm failed: {str(e)[:120]}")
-                all_tags = tags
         else:
             all_tags = tags
 
@@ -1340,7 +1365,6 @@ class TagEnricher:
             tier = "metadata_llm"
         else:
             tier = "rule_based"
-        # Always append bigo amount tag if available and not already present
         all_tags = _append_amount_tag(all_tags, case.bigo)
         logger.info(f"+ Enriched {case.case_id} ({tier}): {all_tags}")
         return {"status": "enriched", "tags": all_tags, "tier": tier, "reason": ""}
@@ -1348,7 +1372,9 @@ class TagEnricher:
     def _classify_with_llm(self, case: Case) -> list[str]:
         """Use LLM to classify a case from metadata. Returns list of tag strings."""
         prompt = build_llm_classification_prompt(case)
-        response = self._invoke_llm(prompt)
+        response = self._metadata_llm_cb.call(
+            lambda: self._invoke_llm(prompt, circuit_name="metadata_llm")
+        )
         return parse_llm_response(response)
 
     def _classify_with_llm_from_sources(
@@ -1356,7 +1382,9 @@ class TagEnricher:
     ) -> list[str]:
         """Use LLM to classify a case from source documents. Returns list of tag strings."""
         prompt = build_llm_classification_prompt_from_sources(case, evidence_text)
-        response = self._invoke_llm(prompt)
+        response = self._source_llm_cb.call(
+            lambda: self._invoke_llm(prompt, circuit_name="source_llm")
+        )
         return parse_llm_response(response)
 
     def enrich_cases(self, cases, force: bool = False, dry_run: bool = False) -> dict:
@@ -1371,7 +1399,6 @@ class TagEnricher:
             "rule_based": 0,
         }
 
-        # Convert to list to get total count for progress logging
         cases_list = list(cases)
         total_cases = len(cases_list)
 
