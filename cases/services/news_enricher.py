@@ -11,7 +11,7 @@ from datetime import date, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote_plus, urljoin, urlparse
+from urllib.parse import quote_plus, urlparse
 
 import requests
 from django.db import close_old_connections, transaction
@@ -122,24 +122,6 @@ class _TextExtractor(HTMLParser):
                 self.text_parts.append(text)
 
 
-class _ImageExtractor(HTMLParser):
-    """Extract img tags from HTML."""
-
-    def __init__(self, base_url=""):
-        super().__init__()
-        self.base_url = base_url
-        self.images = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "img":
-            attrs_dict = dict(attrs)
-            src = attrs_dict.get("src", "")
-            alt = attrs_dict.get("alt", "") or attrs_dict.get("title", "")
-            if src:
-                full_url = urljoin(self.base_url, src)
-                self.images.append({"url": full_url, "alt": alt})
-
-
 def _extract_text_from_html(html: str) -> str:
     """Extract visible text from HTML."""
     parser = _TextExtractor()
@@ -150,83 +132,6 @@ def _extract_text_from_html(html: str) -> str:
     text = " ".join(parser.text_parts)
     text = re.sub(r"\s+", " ", text).strip()
     return text
-
-
-def _extract_images_from_html(html: str, base_url: str = "") -> list[dict]:
-    """Extract content-relevant image URLs from HTML, filtering out non-editorial images."""
-    parser = _ImageExtractor(base_url=base_url)
-    try:
-        parser.feed(html)
-    except Exception:
-        pass
-    return _filter_content_images(parser.images)
-
-
-_IMAGE_FILTER_PATTERNS = [
-    re.compile(r"\.svg(\?|$)", re.IGNORECASE),
-    re.compile(r"\.gif(\?|$)", re.IGNORECASE),
-    re.compile(r"[-_]?logo[/_.-]", re.IGNORECASE),
-    re.compile(r"[-_]?banner[/_.-]", re.IGNORECASE),
-    re.compile(r"/ad(?:vertisement)?[/_-]?", re.IGNORECASE),
-    re.compile(r"[-_]?icon[/_.-]", re.IGNORECASE),
-    re.compile(r"header[_-]?icon", re.IGNORECASE),
-    re.compile(r"/pixel[/_-]?", re.IGNORECASE),
-    re.compile(r"/track(?:ing)?[/_-]?", re.IGNORECASE),
-    re.compile(r"/widget[/_-]?", re.IGNORECASE),
-    re.compile(r"/avatar[/_-]?", re.IGNORECASE),
-    re.compile(r"/social[/_-]?", re.IGNORECASE),
-    re.compile(r"/share[/_-]?", re.IGNORECASE),
-    re.compile(r"/button[/_-]?", re.IGNORECASE),
-    re.compile(r"/promo[/_-]?", re.IGNORECASE),
-    re.compile(r"trn\.png", re.IGNORECASE),
-    re.compile(r"muna\.png", re.IGNORECASE),
-    re.compile(r"app[_-]?store", re.IGNORECASE),
-    re.compile(r"play[_-]?store", re.IGNORECASE),
-    re.compile(r"google[_-]?play", re.IGNORECASE),
-    re.compile(r"flaticon\.com", re.IGNORECASE),
-    re.compile(r"cdn-icons", re.IGNORECASE),
-    re.compile(r"/bigyaapan/", re.IGNORECASE),
-    re.compile(r"/authors/", re.IGNORECASE),
-    re.compile(r"facebook\.com/tr", re.IGNORECASE),
-]
-_IMAGE_ALT_BLOCKLIST = frozenset(
-    {
-        "logo",
-        "banner",
-        "ad",
-        "icon",
-        "avatar",
-        "thumb",
-        "pixel",
-        "sponsor",
-        "header",
-        "app store",
-        "google play",
-        "download",
-        "qr",
-    }
-)
-
-
-def _filter_content_images(images: list[dict]) -> list[dict]:
-    """Remove non-editorial images (logos, ads, trackers, icons, etc.)."""
-    filtered = []
-    for img in images:
-        url = img.get("url", "")
-        parsed = urlparse(url)
-        if parsed.scheme and parsed.scheme not in {"http", "https"}:
-            continue
-        alt = (img.get("alt", "") or "").lower().strip()
-
-        if any(w in alt for w in _IMAGE_ALT_BLOCKLIST):
-            continue
-
-        url_lower = url.lower()
-        if any(p.search(url_lower) for p in _IMAGE_FILTER_PATTERNS):
-            continue
-
-        filtered.append(img)
-    return filtered
 
 
 def _extract_title_from_html(html: str) -> str:
@@ -810,8 +715,19 @@ class NewsEnricher:
             stats["reason"] = "all_already_linked"
             return stats
 
+        remaining_slots = self.max_articles_per_case - len(case_linked_urls)
+        if remaining_slots <= 0 and not force:
+            stats["status"] = "skipped"
+            stats["reason"] = "max_articles_reached"
+            return stats
+
         accepted = self._fetch_and_verify_candidates(
-            new_candidates, case, api_key, stats, press_release_text
+            new_candidates,
+            case,
+            api_key,
+            stats,
+            press_release_text,
+            max_to_accept=remaining_slots,
         )
 
         if not accepted and stats.get("already_linked", 0) == 0:
@@ -876,6 +792,7 @@ class NewsEnricher:
         api_key: Optional[str],
         stats: dict,
         press_release_text: Optional[str] = None,
+        max_to_accept: Optional[int] = None,
     ) -> list[dict]:
         """Fetch candidate articles in parallel, then verify with LLM in parallel."""
         fetched = [
@@ -886,6 +803,8 @@ class NewsEnricher:
 
         if not fetched:
             return []
+
+        limit = max_to_accept if max_to_accept is not None else self.max_articles_per_case
 
         accepted = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
@@ -902,7 +821,7 @@ class NewsEnricher:
                 future_to_result[future] = result
 
             for future in concurrent.futures.as_completed(future_to_result):
-                if len(accepted) >= self.max_articles_per_case:
+                if len(accepted) >= limit:
                     for f in future_to_result:
                         f.cancel()
                     break
@@ -955,15 +874,12 @@ class NewsEnricher:
                 article_title = _extract_title_from_html(html) or candidate.get(
                     "title", ""
                 )
-                images = _extract_images_from_html(html, base_url=url)[:5]
                 article_date = _extract_publication_date(html)
                 stats["fetched"] += 1
                 return {
                     "candidate": candidate,
-                    "html": html,
                     "article_text": article_text,
                     "article_title": article_title,
-                    "images": images,
                     "article_date": article_date,
                 }
             except Exception as exc:
@@ -1026,8 +942,6 @@ class NewsEnricher:
         return {
             "title": article_title,
             "url": url,
-            "text": article_text,
-            "images": fetch_result["images"],
             "publication_date": fetch_result.get("article_date"),
             "confidence": confidence,
             "reason": reason,
@@ -1542,17 +1456,22 @@ Excerpt: {article_excerpt}"""
         return source
 
     def _build_source_description(self, article: dict) -> str:
-        """Build description with image URLs only.
+        """Build a short audit description for the source.
 
-        Format: one ``Image: <url>`` line per image. No article text.
+        Includes outlet name, publication date, and LLM verification reason.
+        No article text or image URLs.
         """
-        images = article.get("images", [])
+        outlet = _guess_outlet(article.get("url", ""))
+        pub_date = article.get("publication_date")
+        date_str = pub_date.isoformat() if pub_date else "unknown date"
+        confidence = article.get("confidence", "unknown")
+        reason = article.get("reason", "")
 
-        parts = []
-        for img in images[:10]:
-            parts.append(f"Image: {img['url']}")
-
-        return "\n".join(parts) if parts else ""
+        return (
+            f"Source: {outlet} | Published: {date_str} | "
+            f"LLM confidence: {confidence}"
+            + (f" — {reason}" if reason else "")
+        )
 
     def _build_evidence_description(self, article: dict) -> str:
         """Build evidence entry description in Nepali."""

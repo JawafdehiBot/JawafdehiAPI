@@ -19,7 +19,6 @@ from cases.management.commands.enrich_ciaa_news_articles import Command
 from cases.models import Case, CaseState, CaseType, DocumentSource, SourceType
 from cases.services.news_enricher import (
     NewsEnricher,
-    _extract_images_from_html,
     _extract_text_from_html,
     _extract_title_from_html,
     _generate_query_variations,
@@ -180,19 +179,6 @@ class TestNewsEnricherService:
         title = _extract_title_from_html(html)
         assert title == "Nepal Corruption Case Verdict"
 
-    def test_extract_images_from_html(self):
-        html = self._get_sample_html()
-        images = _extract_images_from_html(html)
-        assert len(images) == 2
-        assert images[0]["url"] == "https://example.com/image1.jpg"
-        assert images[1]["url"] == "https://example.com/image2.jpg"
-
-    def test_extract_images_with_base_url(self):
-        html = '<img src="/images/photo.jpg" alt="Photo">'
-        images = _extract_images_from_html(html, base_url="https://example.com/news/")
-        assert len(images) >= 1
-        assert any("example.com" in img["url"] for img in images)
-
     def test_guess_outlet(self):
         assert "Ekantipur" == _guess_outlet("https://ekantipur.com/news/article")
         assert "Onlinekhabar" == _guess_outlet("https://www.onlinekhabar.com/content")
@@ -311,11 +297,11 @@ class TestNewsEnricherService:
             second_evidence_count = len(case.evidence)
             assert first_evidence_count == second_evidence_count
 
-    def test_images_stored_in_description(self):
+    def test_source_description_contains_outlet_and_confidence(self):
         case = self._create_case()
         enricher = self._create_enricher()
-        search_results = self._mock_search_results(prefix="img-test")
-        html = self._get_sample_html(body="Test article with images. " * 50)
+        search_results = self._mock_search_results(prefix="desc-test")
+        html = self._get_sample_html(body="Test article for description check. " * 50)
 
         p1, p2, p3 = self._mock_setup(search_results=search_results, fetch_html=html)
         with p1, p2, p3:
@@ -323,9 +309,8 @@ class TestNewsEnricherService:
 
             source = DocumentSource.objects.first()
             assert source is not None
-            assert "Image:" in source.description
-            assert "https://example.com/image1.jpg" in source.description
-            assert "https://example.com/image2.jpg" in source.description
+            assert "Source:" in source.description
+            assert "LLM confidence:" in source.description
 
     def test_publication_date_stored(self):
         case = self._create_case()
@@ -450,8 +435,8 @@ class TestNewsEnricherService:
             assert source is not None
             desc = source.description
             assert len(desc) > 0
-            assert "https://example" in desc
-            assert "Image:" in desc if source.description else True
+            assert "Source:" in desc
+            assert "Published:" in desc
 
     def test_evidence_description_present(self):
         case = self._create_case()
