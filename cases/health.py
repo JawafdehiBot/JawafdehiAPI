@@ -8,6 +8,7 @@ Exposes:
 from __future__ import annotations
 
 from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.views.decorators.http import require_http_methods
 
 from cases.observability import (
     circuit_breaker_trips,
@@ -20,6 +21,7 @@ from cases.observability import (
 )
 
 
+@require_http_methods(["GET"])
 def enrichment_health(request: HttpRequest) -> JsonResponse:
     """Return enrichment pipeline health status and current metric snapshots."""
     pipeline_snap = pipeline_duration.snapshot()
@@ -66,6 +68,7 @@ def enrichment_health(request: HttpRequest) -> JsonResponse:
     })
 
 
+@require_http_methods(["GET"])
 def enrichment_metrics(request: HttpRequest) -> HttpResponse:
     """Prometheus textfile export endpoint for node_exporter scraping."""
     import tempfile

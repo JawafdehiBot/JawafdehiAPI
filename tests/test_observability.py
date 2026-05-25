@@ -30,7 +30,7 @@ class TestHistogram:
         pipeline_duration.observe(5.0, labels={"tier": "source_llm", "command": "test"})
         snap = pipeline_duration.snapshot()
         assert snap["count"] == 1
-        assert snap["sum"] == 5.0
+        assert snap["sum"] == pytest.approx(5.0)
 
     def test_section_confidence_bounds(self):
         record_confidence("bigo", 0.85)
@@ -80,15 +80,15 @@ class TestCounter:
 class TestGauge:
     def test_null_source_type_ratio(self):
         update_null_source_type_ratio(0.3)
-        assert null_source_type.snapshot() == 0.3
+        assert null_source_type.snapshot() == pytest.approx(0.3)
         update_null_source_type_ratio(1.5)  # clamped
-        assert null_source_type.snapshot() == 1.0
+        assert null_source_type.snapshot() == pytest.approx(1.0)
         update_null_source_type_ratio(-0.5)  # clamped
-        assert null_source_type.snapshot() == 0.0
+        assert null_source_type.snapshot() == pytest.approx(0.0)
 
     def test_nepali_script_coverage(self):
         update_nepali_script_coverage(0.75)
-        assert nepali_script_coverage.snapshot() == 0.75
+        assert nepali_script_coverage.snapshot() == pytest.approx(0.75)
 
 
 class TestExport:
