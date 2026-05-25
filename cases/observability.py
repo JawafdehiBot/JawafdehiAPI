@@ -15,6 +15,8 @@ Exports 9 key metric families:
 from __future__ import annotations
 
 import threading
+import time as _time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
@@ -222,9 +224,6 @@ def export_textfile(path: str) -> None:
 # ---------------------------------------------------------------------------
 # Convenience helpers for pipeline instrumentation
 # ---------------------------------------------------------------------------
-
-import time as _time
-from contextlib import contextmanager
 
 
 @contextmanager
