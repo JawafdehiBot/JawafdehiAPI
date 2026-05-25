@@ -783,9 +783,7 @@ def _collect_evidence_text(case: Case) -> str:  # noqa
 
     all_count = len(source_ids)
     hv_count = high_value.count()
-    logger.info(
-        f"  Found {hv_count}/{all_count} high-value sources"
-    )
+    logger.info(f"  Found {hv_count}/{all_count} high-value sources")
 
     sources = list(itertools.chain(high_value, other))
 
@@ -953,9 +951,7 @@ def _convert_urls(src: DocumentSource) -> str:  # noqa
                         continue
                     data = resp.read(_MAX_DOWNLOAD_BYTES + 1)
                     if len(data) > _MAX_DOWNLOAD_BYTES:
-                        logger.debug(
-                            f"Skipping {url}: >{_MAX_DOWNLOAD_BYTES} bytes"
-                        )
+                        logger.debug(f"Skipping {url}: >{_MAX_DOWNLOAD_BYTES} bytes")
                         continue
                     with open(tmp_path, "wb") as f:
                         f.write(data)
@@ -1002,9 +998,7 @@ _COMPILED_CORRUPTION = _precompile_keyword_map(CORRUPTION_TYPE_KEYWORDS)
 _COMPILED_REGIONS = _precompile_keyword_map(REGION_KEYWORDS)
 
 # Precompute valid tag set for validate_tags
-_VALID_TAGS = frozenset(
-    SECTOR_TAGS + CORRUPTION_TYPE_TAGS + REGION_TAGS + CONTEXT_TAGS
-)
+_VALID_TAGS = frozenset(SECTOR_TAGS + CORRUPTION_TYPE_TAGS + REGION_TAGS + CONTEXT_TAGS)
 
 
 def _match_keywords(
@@ -1253,8 +1247,7 @@ class TagEnricher:
         def _call() -> str:
             if self._llm_client is not None:
                 logger.debug(
-                    "  Using CLI-provided LLM client "
-                    "(bypassing DB LLMProvider)"
+                    "  Using CLI-provided LLM client " "(bypassing DB LLMProvider)"
                 )
                 response = self._llm_client.invoke(prompt)
                 if hasattr(response, "content"):
@@ -1385,8 +1378,7 @@ class TagEnricher:
                     else:
                         all_tags = tags
                         logger.info(
-                            "  - metadata_llm returned no tags, "
-                            "using rule-based"
+                            "  - metadata_llm returned no tags, " "using rule-based"
                         )
                 except Exception as e:
                     logger.warning(f"  - metadata_llm failed: {str(e)[:120]}")

@@ -194,7 +194,11 @@ def export_textfile(path: str) -> None:
                 lines.append(f"{metric.name}_bucket{{{bucket_key}}} {bucket_count}")
 
     counters = [
-        llm_call, cache_hit, quality_gate, likhit_failures, circuit_breaker_trips
+        llm_call,
+        cache_hit,
+        quality_gate,
+        likhit_failures,
+        circuit_breaker_trips,
     ]
     for metric in counters:
         snap = metric.snapshot()

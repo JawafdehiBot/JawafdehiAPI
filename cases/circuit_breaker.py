@@ -47,8 +47,7 @@ class CircuitBreaker:
             elapsed = _time.monotonic() - self._last_failure_time
             remaining = max(0.0, self.cooldown_seconds - elapsed)
             raise CircuitBreakerOpenError(
-                f"Circuit '{self.name}' is open. "
-                f"Retry in {remaining:.0f}s."
+                f"Circuit '{self.name}' is open. " f"Retry in {remaining:.0f}s."
             )
         try:
             result = fn(*args, **kwargs)
