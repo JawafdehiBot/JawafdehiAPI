@@ -1100,6 +1100,8 @@ class NewsEnricher:
 
         Returns new_sources count.
         """
+        pre_existing = self._count_media_news_evidence(case)
+
         new_sources = 0
         if not dry_run and accepted:
             new_sources = self._save_articles(case, accepted)
@@ -1107,12 +1109,13 @@ class NewsEnricher:
             logger.info("  [DRY RUN] Would save %d article(s)", len(accepted))
             for a in accepted:
                 logger.info("    - %s", a["url"][:80])
+            new_sources = len(accepted)
 
-        self._log_case_article_summary(case, dry_run, new_sources)
+        self._log_case_article_summary(case, pre_existing, new_sources)
         return new_sources
 
     def _log_case_article_summary(
-        self, case: Case, dry_run: bool, new_sources: int
+        self, case: Case, pre_existing: int, new_sources: int
     ) -> None:
         """Log the final news article state for a case after enrichment."""
         source_ids = self._extract_source_ids_from_evidence(case.evidence)
@@ -1133,17 +1136,16 @@ class NewsEnricher:
             return
 
         total = len(sources)
-        status = (
+        limit_status = (
             "AT LIMIT"
             if total >= self.max_articles_per_case
-            else f"BELOW LIMIT (slots left: {self.max_articles_per_case - total})"
+            else f"BELOW LIMIT"
         )
 
-        logger.info(
-            "  Final: %d MEDIA_NEWS article(s) linked [%s]",
-            total,
-            status,
-        )
+        logger.info("  --- Article Summary ---")
+        logger.info("  Existing articles:   %d", pre_existing)
+        logger.info("  Added in this run:   %d", new_sources)
+        logger.info("  Final total:         %d [%s]", total, limit_status)
         for s in sources:
             url_str = (
                 self._extract_urls_from_source(s)[0]
@@ -1553,7 +1555,8 @@ Excerpt: {article_excerpt}"""
     def _build_source_description(self, article: dict) -> str:
         """Build a public-facing article description from the LLM summary.
 
-        Falls back to outlet + date when summary is missing.
+        Falls back to outlet + date when summary is missing. Omits missing
+        fields — never writes placeholders like "unknown date".
         """
         summary = article.get("summary")
         if summary:
@@ -1561,8 +1564,9 @@ Excerpt: {article_excerpt}"""
 
         outlet = _guess_outlet(article.get("url", ""))
         pub_date = article.get("publication_date")
-        date_str = pub_date.isoformat() if pub_date else "unknown date"
-        return f"News article from {outlet} ({date_str})."
+        if pub_date:
+            return f"News article from {outlet} ({pub_date.isoformat()})."
+        return f"News article from {outlet}."
 
     def _build_evidence_description(self, article: dict) -> str:
         """Build evidence entry description in Nepali."""
