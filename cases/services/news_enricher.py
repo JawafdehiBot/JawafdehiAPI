@@ -82,10 +82,10 @@ CIAA Special Court corruption case as the case described below.
 You must respond with ONLY a JSON object in one of these two formats:
 
 If the article IS about the same case:
-{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case."}
+{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case.", "summary": "A concise 1-3 sentence summary of what the news article reports (who is involved, what happened, key facts, timeline). Write this as a public-facing article description, not as a matching rationale."}
 
 If the article is NOT about the same case:
-{"relevant": false, "reason": "Brief explanation in English of why this article does not match."}
+{"relevant": false, "reason": "Brief explanation in English of why this article does not match.", "summary": "A concise 1-3 sentence summary of what the news article reports."}
 
 Rules:
 - The article must reference the same corruption case, not just mention the same person in an unrelated context.
@@ -93,6 +93,7 @@ Rules:
 - Matching on defendant name + corruption allegations is medium evidence.
 - If the article is about a different corruption case involving the same person, it is NOT relevant.
 - If the article is about the same person but not about corruption allegations, it is NOT relevant.
+- The "summary" field should describe the article content itself, not how the LLM matched it to the case.
 """
 
 
@@ -665,10 +666,12 @@ class NewsEnricher:
         case_linked_urls = self._get_case_linked_urls(case)
         _, self._existing_url_map = self._get_existing_url_metadata()
 
-        if len(case_linked_urls) >= self.max_articles_per_case and not force:
+        current_media_news_count = self._count_media_news_evidence(case)
+
+        if current_media_news_count >= self.max_articles_per_case and not force:
             logger.info(
-                "  Already has %d article(s) linked (max=%d) — skipping",
-                len(case_linked_urls),
+                "  Already has %d MEDIA_NEWS evidence entries (max=%d) — skipping",
+                current_media_news_count,
                 self.max_articles_per_case,
             )
             return {
@@ -715,7 +718,7 @@ class NewsEnricher:
             stats["reason"] = "all_already_linked"
             return stats
 
-        remaining_slots = self.max_articles_per_case - len(case_linked_urls)
+        remaining_slots = self.max_articles_per_case - current_media_news_count
         if remaining_slots <= 0 and not force:
             stats["status"] = "skipped"
             stats["reason"] = "max_articles_reached"
@@ -918,7 +921,7 @@ class NewsEnricher:
         article_title = fetch_result["article_title"]
 
         if api_key and self.llm_base_url:
-            is_relevant, confidence, reason = self._verify_article_relevance(
+            is_relevant, confidence, reason, summary = self._verify_article_relevance(
                 case=case,
                 article_title=article_title,
                 article_url=url,
@@ -930,6 +933,7 @@ class NewsEnricher:
             is_relevant = False
             confidence = "none"
             reason = "LLM not configured"
+            summary = ""
 
         if not is_relevant:
             stats["rejected"] += 1
@@ -945,6 +949,7 @@ class NewsEnricher:
             "publication_date": fetch_result.get("article_date"),
             "confidence": confidence,
             "reason": reason,
+            "summary": summary,
         }
 
     @staticmethod
@@ -1005,6 +1010,25 @@ class NewsEnricher:
             logger.exception("Failed to load existing URL metadata")
             close_old_connections()
         return urls, url_map
+
+    def _count_media_news_evidence(self, case: Case) -> int:
+        """Count evidence entries that reference MEDIA_NEWS sources (including soft-deleted).
+
+        Uses the evidence JSON list as the ground-truth count so stale entries
+        (soft-deleted or type-changed sources) still count toward the limit.
+        """
+        source_ids = self._extract_source_ids_from_evidence(case.evidence)
+        if not source_ids:
+            return 0
+        try:
+            return DocumentSource.objects.filter(
+                source_id__in=source_ids,
+                source_type=SourceType.MEDIA_NEWS,
+            ).count()
+        except Exception:
+            logger.exception("Failed to count MEDIA_NEWS evidence entries")
+            close_old_connections()
+            return 0
 
     def _get_case_linked_urls(self, case: Case) -> set[str]:
         """Get set of URLs already linked to this specific case via evidence."""
@@ -1072,14 +1096,61 @@ class NewsEnricher:
     def _handle_enrichment_results(
         self, case: Case, accepted: list[dict], dry_run: bool
     ) -> int:
-        """Save articles or log dry-run. Returns new_sources count."""
+        """Save articles or log dry-run, then log final article state for the case.
+
+        Returns new_sources count.
+        """
+        new_sources = 0
         if not dry_run and accepted:
-            return self._save_articles(case, accepted)
-        if dry_run and accepted:
+            new_sources = self._save_articles(case, accepted)
+        elif dry_run and accepted:
             logger.info("  [DRY RUN] Would save %d article(s)", len(accepted))
             for a in accepted:
                 logger.info("    - %s", a["url"][:80])
-        return 0
+
+        self._log_case_article_summary(case, dry_run, new_sources)
+        return new_sources
+
+    def _log_case_article_summary(
+        self, case: Case, dry_run: bool, new_sources: int
+    ) -> None:
+        """Log the final news article state for a case after enrichment."""
+        source_ids = self._extract_source_ids_from_evidence(case.evidence)
+        if not source_ids:
+            logger.info("  Final: 0 MEDIA_NEWS articles linked")
+            return
+
+        try:
+            sources = list(
+                DocumentSource.objects.filter(
+                    source_id__in=source_ids,
+                    source_type=SourceType.MEDIA_NEWS,
+                ).only("source_id", "title", "url")
+            )
+        except Exception:
+            logger.exception("Failed to fetch article state for logging")
+            close_old_connections()
+            return
+
+        total = len(sources)
+        status = (
+            "AT LIMIT"
+            if total >= self.max_articles_per_case
+            else f"BELOW LIMIT (slots left: {self.max_articles_per_case - total})"
+        )
+
+        logger.info(
+            "  Final: %d MEDIA_NEWS article(s) linked [%s]",
+            total,
+            status,
+        )
+        for s in sources:
+            url_str = (
+                self._extract_urls_from_source(s)[0]
+                if self._extract_urls_from_source(s)
+                else "?"
+            )
+            logger.info("    - %s | %s", s.title or "Untitled", url_str)
 
     def _verify_article_relevance(
         self,
@@ -1089,10 +1160,10 @@ class NewsEnricher:
         article_excerpt: str,
         api_key: str,
         press_release_text: Optional[str] = None,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[bool, str, str, str]:
         """Use LLM to verify if an article is about the same case.
 
-        Returns (is_relevant, confidence, reason).
+        Returns (is_relevant, confidence, reason, summary).
         """
         case_number = _resolve_case_number(case)
 
@@ -1139,11 +1210,12 @@ Excerpt: {article_excerpt}"""
         )
 
         if result is None:
-            return False, "error", "LLM response could not be parsed"
+            return False, "error", "LLM response could not be parsed", ""
 
         relevant = result.get("relevant", False)
         confidence = result.get("confidence", "medium")
         reason = result.get("reason", "")
+        summary = result.get("summary", "")
 
         logger.debug(
             "LLM verdict for %s: relevant=%s confidence=%s reason=%s",
@@ -1153,7 +1225,7 @@ Excerpt: {article_excerpt}"""
             reason,
         )
 
-        return relevant, confidence, reason
+        return relevant, confidence, reason, summary
 
     def _get_press_release_content(self, case: Case) -> Optional[str]:
         """Extract press release text for a CIAA case from evidence-linked sources.
@@ -1393,6 +1465,10 @@ Excerpt: {article_excerpt}"""
     def _save_articles(self, case: Case, articles: list[dict]) -> int:
         """Save accepted articles as DocumentSource and link to case evidence.
 
+        Re-checks the MEDIA_NEWS evidence count right before saving to prevent
+        over-storage from stale/raced limit checks. Caps accepted articles
+        to remaining slots even if verification returned more.
+
         Returns number of new sources created.
         """
         new_count = 0
@@ -1400,8 +1476,27 @@ Excerpt: {article_excerpt}"""
         existing_source_ids = self._extract_source_ids_from_evidence(evidence)
         url_to_source = self._existing_url_map
 
+        # Pre-save re-check: count evidence entries (including soft-deleted)
+        # so we don't overshoot the limit even if the early check was stale.
+        current_count = DocumentSource.objects.filter(
+            source_id__in=existing_source_ids,
+            source_type=SourceType.MEDIA_NEWS,
+        ).count()
+        capped_slots = max(0, self.max_articles_per_case - current_count)
+        articles_to_save = articles[:capped_slots]
+
+        if capped_slots < len(articles):
+            logger.info(
+                "  Pre-save limit check: capping %d accepted to %d slots "
+                "(current=%d, max=%d)",
+                len(articles),
+                capped_slots,
+                current_count,
+                self.max_articles_per_case,
+            )
+
         with transaction.atomic():
-            for article in articles:
+            for article in articles_to_save:
                 url = article["url"]
                 existing_source_id = url_to_source.get(url)
 
@@ -1456,22 +1551,18 @@ Excerpt: {article_excerpt}"""
         return source
 
     def _build_source_description(self, article: dict) -> str:
-        """Build a short audit description for the source.
+        """Build a public-facing article description from the LLM summary.
 
-        Includes outlet name, publication date, and LLM verification reason.
-        No article text or image URLs.
+        Falls back to outlet + date when summary is missing.
         """
+        summary = article.get("summary")
+        if summary:
+            return summary
+
         outlet = _guess_outlet(article.get("url", ""))
         pub_date = article.get("publication_date")
         date_str = pub_date.isoformat() if pub_date else "unknown date"
-        confidence = article.get("confidence", "unknown")
-        reason = article.get("reason", "")
-
-        return (
-            f"Source: {outlet} | Published: {date_str} | "
-            f"LLM confidence: {confidence}"
-            + (f" — {reason}" if reason else "")
-        )
+        return f"News article from {outlet} ({date_str})."
 
     def _build_evidence_description(self, article: dict) -> str:
         """Build evidence entry description in Nepali."""

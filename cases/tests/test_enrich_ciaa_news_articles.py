@@ -46,7 +46,9 @@ class TestNewsEnricherService:
         defaults.update(overrides)
         return Case.objects.create(**defaults)
 
-    def _mock_llm_response(self, relevant=True, confidence="high", reason="Match"):
+    def _mock_llm_response(self, relevant=True, confidence="high", reason="Match", summary=""):
+        if not summary:
+            summary = "A corruption case article summary." if relevant else "Unrelated article summary."
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {
@@ -58,6 +60,7 @@ class TestNewsEnricherService:
                                 "relevant": relevant,
                                 "confidence": confidence,
                                 "reason": reason,
+                                "summary": summary,
                             }
                         )
                     }
@@ -297,20 +300,23 @@ class TestNewsEnricherService:
             second_evidence_count = len(case.evidence)
             assert first_evidence_count == second_evidence_count
 
-    def test_source_description_contains_outlet_and_confidence(self):
+    def test_source_description_contains_article_summary(self):
         case = self._create_case()
         enricher = self._create_enricher()
         search_results = self._mock_search_results(prefix="desc-test")
         html = self._get_sample_html(body="Test article for description check. " * 50)
 
-        p1, p2, p3 = self._mock_setup(search_results=search_results, fetch_html=html)
+        p1, p2, p3 = self._mock_setup(
+            search_results=search_results, fetch_html=html,
+            reason="Case number matches.",
+            summary="CIAA filed a case against the survey office chief at Chabahil for illegal assets."
+        )
         with p1, p2, p3:
             enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
 
             source = DocumentSource.objects.first()
             assert source is not None
-            assert "Source:" in source.description
-            assert "LLM confidence:" in source.description
+            assert source.description == "CIAA filed a case against the survey office chief at Chabahil for illegal assets."
 
     def test_publication_date_stored(self):
         case = self._create_case()
@@ -433,10 +439,7 @@ class TestNewsEnricherService:
 
             source = DocumentSource.objects.first()
             assert source is not None
-            desc = source.description
-            assert len(desc) > 0
-            assert "Source:" in desc
-            assert "Published:" in desc
+            assert len(source.description) > 0
 
     def test_evidence_description_present(self):
         case = self._create_case()
