@@ -734,6 +734,17 @@ class NewsEnricher:
         )
 
         if not accepted and stats.get("already_linked", 0) == 0:
+            accepted = self._retry_with_fallback_queries(
+                case=case,
+                api_key=api_key,
+                stats=stats,
+                case_linked_urls=case_linked_urls,
+                remaining_slots=remaining_slots,
+                press_release_text=press_release_text,
+                force=force,
+            )
+
+        if not accepted and stats.get("already_linked", 0) == 0:
             stats["status"] = "no_articles"
             return stats
 
@@ -787,6 +798,115 @@ class NewsEnricher:
             len(queries),
         )
         return all_candidates
+
+    _RETRY_MAX = 3
+
+    def _generate_fallback_queries(self, case: Case, attempt: int) -> list[str]:
+        """Generate progressively simpler fallback search queries.
+
+        Each retry attempt uses a different strategy to maximize the odds of
+        finding articles that the primary query variations missed.
+        """
+        accused_names = _get_accused_names(case)
+        title = case.title or ""
+
+        if attempt == 0:
+            # First retry: quoted accused name + Nepal
+            queries = []
+            for name in accused_names[:2]:
+                name_clean = re.sub(r"\s+", " ", name).strip()
+                if name_clean and len(name_clean) >= 3:
+                    queries.append(f'"{name_clean}" Nepal')
+            if title and len(title) > 10:
+                queries.append(title[:100])
+            return queries[:5]
+
+        if attempt == 1:
+            # Second retry: accused name + "corruption" or "भ्रष्टाचार", no quotes
+            queries = []
+            for name in accused_names[:2]:
+                name_clean = re.sub(r"\s+", " ", name).strip()
+                if name_clean and len(name_clean) >= 3:
+                    queries.append(f"{name_clean} corruption Nepal")
+                    queries.append(f"{name_clean} भ्रष्टाचार")
+            return queries[:5]
+
+        # Third retry: just case title keywords + Nepal
+        title_keywords = _extract_title_keywords(title)
+        if title_keywords:
+            return [f"{title_keywords} Nepal"]
+        if accused_names:
+            name_clean = re.sub(r"\s+", " ", accused_names[0]).strip()
+            if name_clean and len(name_clean) >= 3:
+                return [f"{name_clean} Nepal"]
+        return ["CIAA Nepal corruption"]
+
+    def _retry_with_fallback_queries(
+        self,
+        case: Case,
+        api_key: Optional[str],
+        stats: dict,
+        case_linked_urls: set[str],
+        remaining_slots: int,
+        press_release_text: Optional[str],
+        force: bool,
+    ) -> list[dict]:
+        """Retry enrichment with fallback query strategies when initial search yields 0 articles.
+
+        Retries up to _RETRY_MAX times, each with different query structures.
+        Stops early if any retry finds ≥1 accepted article.
+        """
+        for attempt in range(self._RETRY_MAX):
+            fallback_queries = self._generate_fallback_queries(case, attempt)
+            logger.info(
+                "  Retry %d/%d: fallback search with %d queries",
+                attempt + 1,
+                self._RETRY_MAX,
+                len(fallback_queries),
+            )
+
+            retry_candidates = self._search_candidates(fallback_queries, stats)
+
+            new_candidates, retry_linked = self._filter_case_candidates(
+                retry_candidates, case_linked_urls, force
+            )
+            if retry_linked > 0:
+                stats["already_linked"] += retry_linked
+
+            if not new_candidates:
+                logger.info(
+                    "  Retry %d/%d: no new candidates found",
+                    attempt + 1,
+                    self._RETRY_MAX,
+                )
+                continue
+
+            accepted = self._fetch_and_verify_candidates(
+                new_candidates,
+                case,
+                api_key,
+                stats,
+                press_release_text,
+                max_to_accept=remaining_slots,
+            )
+
+            if accepted:
+                logger.info(
+                    "  Retry %d/%d: found %d accepted article(s)",
+                    attempt + 1,
+                    self._RETRY_MAX,
+                    len(accepted),
+                )
+                return accepted
+
+            logger.info(
+                "  Retry %d/%d: 0 accepted articles",
+                attempt + 1,
+                self._RETRY_MAX,
+            )
+
+        logger.info("  All %d retries exhausted — marking as no_articles", self._RETRY_MAX)
+        return []
 
     def _fetch_and_verify_candidates(
         self,

@@ -455,6 +455,58 @@ class TestNewsEnricherService:
             assert entry["source_id"]
             assert entry["description"]
 
+    def test_retry_on_zero_articles_first_retry_succeeds(self):
+        """When initial search yields 0 accepted, retry with fallback queries finds articles."""
+        case = self._create_case()
+        enricher = self._create_enricher(max_articles_per_case=3)
+
+        fallback_results = [
+            {"title": "Fallback Article", "url": "https://example-fallback.com/news/1", "snippet": "..."},
+        ]
+
+        # _search_candidates returns empty on first call, results on subsequent calls
+        original_search_candidates = enricher._search_candidates
+        call_count = [0]
+
+        def _patched_search_candidates(queries, stats_dict):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return []  # initial search: empty
+            # retry attempts: return fallback results
+            return fallback_results
+
+        enricher._search_candidates = _patched_search_candidates
+
+        with patch(
+            "cases.services.news_enricher._fetch_article_content",
+            return_value=self._get_sample_html(body="Fallback article content. " * 50),
+        ), patch("requests.post") as mock_post:
+            mock_post.return_value = self._mock_llm_response(
+                relevant=True, reason="Match via fallback.", summary="A fallback-matched article summary."
+            )
+
+            stats = enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
+
+            assert stats["accepted"] >= 1
+            assert stats["new_sources"] >= 1
+            case.refresh_from_db()
+            assert len(case.evidence) >= 1
+
+    def test_retry_on_zero_articles_all_retries_exhausted(self):
+        """When all retries return 0 articles, case is marked as no_articles."""
+        case = self._create_case()
+        enricher = self._create_enricher(max_articles_per_case=3)
+
+        with patch(
+            "cases.services.news_enricher._search_duckduckgo",
+            return_value=[],  # all searches return empty
+        ):
+            stats = enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
+
+            assert stats["status"] == "no_articles"
+            assert stats["accepted"] == 0
+            assert stats["new_sources"] == 0
+
     def test_max_articles_per_case_enforced(self):
         case = self._create_case()
         enricher = self._create_enricher(max_articles_per_case=2)
