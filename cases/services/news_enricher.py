@@ -483,6 +483,24 @@ def _fallback_parse_relevance(raw_text: str) -> Optional[dict]:
     return None
 
 
+def _safe_parse_http_json(raw_text: str) -> dict:
+    """Parse an HTTP JSON body tolerantly.
+
+    Uses raw_decode to handle concatenated streaming chunks where the proxy
+    appended multiple JSON objects instead of streaming a single payload.
+    """
+    text = raw_text.strip()
+    try:
+        decoder = json.JSONDecoder()
+        obj, _end = decoder.raw_decode(text)
+        return obj
+    except json.JSONDecodeError:
+        pass
+    raise json.JSONDecodeError(
+        "raw_decode failed for HTTP JSON body", text[:500], 0
+    )
+
+
 def _call_llm(
     system_prompt: str,
     user_prompt: str,
@@ -532,7 +550,7 @@ def _call_llm(
             return None
 
         try:
-            data = resp.json()
+            data = _safe_parse_http_json(resp.text)
         except json.JSONDecodeError as exc:
             logger.warning("LLM response JSON decode failed: %s", exc)
             return None
