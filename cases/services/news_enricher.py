@@ -469,6 +469,7 @@ def _fallback_parse_relevance(raw_text: str) -> Optional[dict]:
         is_relevant = match.group(1) == "true"
         conf_match = re.search(r'"confidence"\s*:\s*"([^"]+)"', raw_text)
         reason_match = re.search(r'"reason"\s*:\s*"([^"]*)"', raw_text)
+        summary_match = re.search(r'"summary"\s*:\s*"([^"]*)"', raw_text)
         return {
             "relevant": is_relevant,
             "confidence": conf_match.group(1) if conf_match else "low",
@@ -477,6 +478,7 @@ def _fallback_parse_relevance(raw_text: str) -> Optional[dict]:
                 if reason_match
                 else "fallback: extracted from raw response"
             ),
+            "summary": summary_match.group(1) if summary_match else "",
         }
     return None
 
@@ -503,7 +505,7 @@ def _call_llm(
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
-        "max_tokens": 800,
+        "max_tokens": 1200,
     }
 
     last_exc = None
@@ -558,16 +560,29 @@ def _call_llm(
 
 
 def _parse_llm_json(text: str) -> Optional[dict]:
-    """Extract and parse JSON from LLM response text."""
+    """Extract and parse the first complete JSON object from LLM response text.
+
+    Uses json.JSONDecoder.raw_decode() to find the boundary of the first valid
+    JSON object, then ignores any trailing text (explanations, markdown fences,
+    or a second JSON object the model may have appended).
+    """
     text = text.strip()
     json_start = text.find("{")
-    json_end = text.rfind("}")
-    if json_start == -1 or json_end == -1:
+    if json_start == -1:
         return None
     try:
-        return json.loads(text[json_start : json_end + 1])
+        decoder = json.JSONDecoder()
+        obj, _end = decoder.raw_decode(text, json_start)
+        return obj
     except json.JSONDecodeError:
-        return None
+        # Strip markdown code fences and retry
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE)
+        try:
+            decoder = json.JSONDecoder()
+            obj, _end = decoder.raw_decode(cleaned, cleaned.find("{"))
+            return obj
+        except json.JSONDecodeError:
+            return None
 
 
 class NewsEnricher:
@@ -1089,21 +1104,6 @@ class NewsEnricher:
             for entry in evidence
             if isinstance(entry, dict) and entry.get("source_id")
         }
-
-    def _get_url_to_source_map(self) -> dict[str, str]:
-        """Get mapping from URL to source_id for existing MEDIA_NEWS sources."""
-        url_map = {}
-        try:
-            for source in DocumentSource.objects.filter(
-                source_type=SourceType.MEDIA_NEWS, is_deleted=False
-            ).only("url", "source_id"):
-                for u in self._extract_urls_from_source(source):
-                    if u not in url_map:
-                        url_map[u] = source.source_id
-        except Exception:
-            logger.exception("Failed to load URL-to-source map")
-            close_old_connections()
-        return url_map
 
     def _index_source_url(
         self, urls: set[str], url_map: dict[str, str], source
