@@ -21,6 +21,7 @@ from cases.services.news_enricher import (
     NewsEnricher,
     _extract_text_from_html,
     _extract_title_from_html,
+    _fix_mojibake,
     _generate_query_variations,
     _guess_outlet,
     _parse_llm_json,
@@ -181,6 +182,26 @@ class TestNewsEnricherService:
         html = self._get_sample_html(title="Nepal Corruption Case Verdict")
         title = _extract_title_from_html(html)
         assert title == "Nepal Corruption Case Verdict"
+
+    def test_fix_mojibake_repairs_latin1_utf8_double_encode(self):
+        mangled = (
+            "à¤…à¤–à¥à¤¤à¤¿à¤¯à¤¾à¤° à¤¦à¥à¤°à¥à¤ªà¤¯à¥‹à¤— "
+            "à¤…à¤¨à¥à¤¸à¤¨à¥à¤§à¤¾à¤¨ à¤†à¤¯à¥‹à¤—à¤²à¥‡"
+        )
+        repaired = _fix_mojibake(mangled)
+        assert "अख्तियार" in repaired
+        assert "दुरुपयोग" in repaired
+        assert "अनुसन्धान" in repaired
+
+    def test_fix_mojibake_passes_clean_text(self):
+        clean = "अख्तियार दुरुपयोग अनुसन्धान आयोगले"
+        assert _fix_mojibake(clean) == clean
+
+    def test_fix_mojibake_passes_ascii(self):
+        assert _fix_mojibake("CIAA corruption case") == "CIAA corruption case"
+
+    def test_fix_mojibake_empty_string(self):
+        assert _fix_mojibake("") == ""
 
     def test_guess_outlet(self):
         assert "Ekantipur" == _guess_outlet("https://ekantipur.com/news/article")

@@ -123,6 +123,21 @@ class _TextExtractor(HTMLParser):
                 self.text_parts.append(text)
 
 
+def _fix_mojibake(text: str) -> str:
+    """Repair UTF-8 text that was decoded as Latin-1 then re-encoded.
+
+    The pattern `à¤...` is the hallmark of Devanagari script that got
+    Latin-1-mangled somewhere in the HTTP → HTML → Python pipeline.
+    """
+    if not text:
+        return text
+    try:
+        # Encoding as Latin-1 and decoding as UTF-8 reverses the double-encoding
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return text
+
+
 def _extract_text_from_html(html: str) -> str:
     """Extract visible text from HTML."""
     parser = _TextExtractor()
@@ -132,7 +147,7 @@ def _extract_text_from_html(html: str) -> str:
         pass
     text = " ".join(parser.text_parts)
     text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return _fix_mojibake(text)
 
 
 def _extract_title_from_html(html: str) -> str:
@@ -141,7 +156,7 @@ def _extract_title_from_html(html: str) -> str:
     match = re.search(r"<title[^>]*>([^<]*)</title>", safe_html, re.IGNORECASE)
     if match:
         title = re.sub(r"\s+", " ", match.group(1)).strip()
-        return title
+        return _fix_mojibake(title)
     return ""
 
 
@@ -1677,11 +1692,12 @@ Excerpt: {article_excerpt}"""
         self, article: dict, fallback_date: Optional[date] = None
     ) -> DocumentSource:
         """Create a DocumentSource record for an accepted news article."""
-        description = self._build_source_description(article)
+        description = _fix_mojibake(self._build_source_description(article))
+        title = _fix_mojibake(article["title"]) if article.get("title") else "Untitled News Article"
         pub_date = article.get("publication_date") or fallback_date or date.today()
 
         source = DocumentSource(
-            title=article["title"] or "Untitled News Article",
+            title=title,
             description=description,
             source_type=SourceType.MEDIA_NEWS,
             url=[article["url"]],
@@ -1715,7 +1731,7 @@ Excerpt: {article_excerpt}"""
         if pub_date:
             date_str = f" ({pub_date.isoformat()})"
 
-        return f"{outlet}{date_str} ले यस मुद्दासम्बन्धी समाचार प्रकाशित गरेको।"
+        return _fix_mojibake(f"{outlet}{date_str} ले यस मुद्दासम्बन्धी समाचार प्रकाशित गरेको।")
 
 
 def _guess_outlet(url: str) -> str:
