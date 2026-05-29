@@ -511,9 +511,7 @@ def _safe_parse_http_json(raw_text: str) -> dict:
         return obj
     except json.JSONDecodeError:
         pass
-    raise json.JSONDecodeError(
-        "raw_decode failed for HTTP JSON body", text[:500], 0
-    )
+    raise json.JSONDecodeError("raw_decode failed for HTTP JSON body", text[:500], 0)
 
 
 def _call_llm(
@@ -953,7 +951,9 @@ class NewsEnricher:
                 self._RETRY_MAX,
             )
 
-        logger.info("  All %d retries exhausted — marking as no_articles", self._RETRY_MAX)
+        logger.info(
+            "  All %d retries exhausted — marking as no_articles", self._RETRY_MAX
+        )
         return []
 
     def _fetch_and_verify_candidates(
@@ -975,7 +975,9 @@ class NewsEnricher:
         if not fetched:
             return []
 
-        limit = max_to_accept if max_to_accept is not None else self.max_articles_per_case
+        limit = (
+            max_to_accept if max_to_accept is not None else self.max_articles_per_case
+        )
 
         accepted = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
@@ -1290,9 +1292,7 @@ class NewsEnricher:
 
         total = len(sources)
         limit_status = (
-            "AT LIMIT"
-            if total >= self.max_articles_per_case
-            else f"BELOW LIMIT"
+            "AT LIMIT" if total >= self.max_articles_per_case else "BELOW LIMIT"
         )
 
         logger.info("  --- Article Summary ---")
@@ -1693,7 +1693,11 @@ Excerpt: {article_excerpt}"""
     ) -> DocumentSource:
         """Create a DocumentSource record for an accepted news article."""
         description = _fix_mojibake(self._build_source_description(article))
-        title = _fix_mojibake(article["title"]) if article.get("title") else "Untitled News Article"
+        title = (
+            _fix_mojibake(article["title"])
+            if article.get("title")
+            else "Untitled News Article"
+        )
         pub_date = article.get("publication_date") or fallback_date or date.today()
 
         source = DocumentSource(
@@ -1731,7 +1735,9 @@ Excerpt: {article_excerpt}"""
         if pub_date:
             date_str = f" ({pub_date.isoformat()})"
 
-        return _fix_mojibake(f"{outlet}{date_str} ले यस मुद्दासम्बन्धी समाचार प्रकाशित गरेको।")
+        return _fix_mojibake(
+            f"{outlet}{date_str} ले यस मुद्दासम्बन्धी समाचार प्रकाशित गरेको।"
+        )
 
 
 def _guess_outlet(url: str) -> str:

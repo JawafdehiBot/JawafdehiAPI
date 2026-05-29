@@ -47,9 +47,15 @@ class TestNewsEnricherService:
         defaults.update(overrides)
         return Case.objects.create(**defaults)
 
-    def _mock_llm_response(self, relevant=True, confidence="high", reason="Match", summary=""):
+    def _mock_llm_response(
+        self, relevant=True, confidence="high", reason="Match", summary=""
+    ):
         if not summary:
-            summary = "A corruption case article summary." if relevant else "Unrelated article summary."
+            summary = (
+                "A corruption case article summary."
+                if relevant
+                else "Unrelated article summary."
+            )
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = {
@@ -328,16 +334,20 @@ class TestNewsEnricherService:
         html = self._get_sample_html(body="Test article for description check. " * 50)
 
         p1, p2, p3 = self._mock_setup(
-            search_results=search_results, fetch_html=html,
+            search_results=search_results,
+            fetch_html=html,
             reason="Case number matches.",
-            summary="CIAA filed a case against the survey office chief at Chabahil for illegal assets."
+            summary="CIAA filed a case against the survey office chief at Chabahil for illegal assets.",
         )
         with p1, p2, p3:
             enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
 
             source = DocumentSource.objects.first()
             assert source is not None
-            assert source.description == "CIAA filed a case against the survey office chief at Chabahil for illegal assets."
+            assert (
+                source.description
+                == "CIAA filed a case against the survey office chief at Chabahil for illegal assets."
+            )
 
     def test_publication_date_stored(self):
         case = self._create_case()
@@ -482,11 +492,15 @@ class TestNewsEnricherService:
         enricher = self._create_enricher(max_articles_per_case=3)
 
         fallback_results = [
-            {"title": "Fallback Article", "url": "https://example-fallback.com/news/1", "snippet": "..."},
+            {
+                "title": "Fallback Article",
+                "url": "https://example-fallback.com/news/1",
+                "snippet": "...",
+            },
         ]
 
         # _search_candidates returns empty on first call, results on subsequent calls
-        original_search_candidates = enricher._search_candidates
+        _ = enricher._search_candidates
         call_count = [0]
 
         def _patched_search_candidates(queries, stats_dict):
@@ -503,7 +517,9 @@ class TestNewsEnricherService:
             return_value=self._get_sample_html(body="Fallback article content. " * 50),
         ), patch("requests.post") as mock_post:
             mock_post.return_value = self._mock_llm_response(
-                relevant=True, reason="Match via fallback.", summary="A fallback-matched article summary."
+                relevant=True,
+                reason="Match via fallback.",
+                summary="A fallback-matched article summary.",
             )
 
             stats = enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
