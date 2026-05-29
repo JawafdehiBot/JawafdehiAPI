@@ -607,7 +607,7 @@ def _parse_llm_json(text: str) -> Optional[dict]:
         return obj
     except json.JSONDecodeError:
         # Strip markdown code fences and retry
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE)
+        cleaned = re.sub(r"(?:^```(?:json)?\s*|\s*```$)", "", text, flags=re.MULTILINE)
         try:
             decoder = json.JSONDecoder()
             obj, _end = decoder.raw_decode(cleaned, cleaned.find("{"))
@@ -677,6 +677,48 @@ class NewsEnricher:
         Returns stats dict with status and counters.
         """
         api_key = self._resolve_api_key(self.llm_api_key)
+        stats = self._validate_prerequisites(case, api_key, dry_run)
+        if stats is not None:
+            return stats
+
+        case_number = _resolve_case_number(case)
+        self._log_case_progress(case, case_number, case_num, total_cases)
+
+        case_linked_urls = self._get_case_linked_urls(case)
+        _, self._existing_url_map = self._get_existing_url_metadata()
+
+        if self._is_already_saturated(case, force):
+            return self._make_stats("skipped", "already_saturated")
+
+        queries = _generate_query_variations(case)
+        if not queries:
+            logger.info("  No search queries generated")
+            stats = self._make_stats("skipped")
+            stats["reason"] = "no_queries"
+            return stats
+
+        press_release_text = self._get_press_release_content(case)
+        if press_release_text:
+            logger.info(
+                "  INFO: Press release context: %d chars", len(press_release_text)
+            )
+        else:
+            logger.warning(
+                "  WARNING: no press release text — LLM verification will lack official case context"
+            )
+
+        accepted, stats = self._perform_enrichment(
+            case, queries, api_key, case_linked_urls, press_release_text, force
+        )
+
+        if not accepted and stats.get("already_linked", 0) == 0:
+            stats["status"] = "no_articles"
+            return stats
+
+        stats["new_sources"] = self._handle_enrichment_results(case, accepted, dry_run)
+        return stats
+
+    def _validate_prerequisites(self, case, api_key, dry_run):
         if not dry_run and not api_key:
             return {
                 "status": "skipped",
@@ -694,12 +736,23 @@ class NewsEnricher:
                 "No LLM API key configured — article relevance verification disabled. "
                 "Set JAWAFDEHI_LLM_API_KEY, ANTHROPIC_API_KEY, or use --llm-api-key."
             )
+        return None
 
-        case_number = _resolve_case_number(case)
-        self._log_case_progress(case, case_number, case_num, total_cases)
+    def _is_already_saturated(self, case, force):
+        current_media_news_count = self._count_media_news_evidence(case)
+        if current_media_news_count >= self.max_articles_per_case and not force:
+            logger.info(
+                "  Already has %d MEDIA_NEWS evidence entries (max=%d) — skipping",
+                current_media_news_count,
+                self.max_articles_per_case,
+            )
+            return True
+        return False
 
+    @staticmethod
+    def _make_stats(status="processed", reason=""):
         stats = {
-            "status": "processed",
+            "status": status,
             "searched": 0,
             "fetched": 0,
             "accepted": 0,
@@ -708,49 +761,17 @@ class NewsEnricher:
             "already_linked": 0,
             "new_sources": 0,
         }
+        if reason:
+            stats["reason"] = reason
+        return stats
 
-        case_linked_urls = self._get_case_linked_urls(case)
-        _, self._existing_url_map = self._get_existing_url_metadata()
-
+    def _perform_enrichment(
+        self, case, queries, api_key, case_linked_urls, press_release_text, force
+    ):
+        stats = self._make_stats()
         current_media_news_count = self._count_media_news_evidence(case)
 
-        if current_media_news_count >= self.max_articles_per_case and not force:
-            logger.info(
-                "  Already has %d MEDIA_NEWS evidence entries (max=%d) — skipping",
-                current_media_news_count,
-                self.max_articles_per_case,
-            )
-            return {
-                "status": "skipped",
-                "reason": "already_saturated",
-                "searched": 0,
-                "fetched": 0,
-                "accepted": 0,
-                "rejected": 0,
-                "errors": 0,
-                "already_linked": 0,
-                "new_sources": 0,
-            }
-
-        queries = _generate_query_variations(case)
-        if not queries:
-            logger.info("  No search queries generated")
-            stats["status"] = "skipped"
-            stats["reason"] = "no_queries"
-            return stats
-
-        press_release_text = self._get_press_release_content(case)
-        if press_release_text:
-            logger.info(
-                "  INFO: Press release context: %d chars", len(press_release_text)
-            )
-        else:
-            logger.warning(
-                "  WARNING: no press release text — LLM verification will lack official case context"
-            )
-
         all_candidates = self._search_candidates(queries, stats)
-
         new_candidates, already_linked = self._filter_case_candidates(
             all_candidates, case_linked_urls, force
         )
@@ -762,13 +783,13 @@ class NewsEnricher:
         if not new_candidates and already_linked > 0 and not force:
             stats["status"] = "skipped"
             stats["reason"] = "all_already_linked"
-            return stats
+            return [], stats
 
         remaining_slots = self.max_articles_per_case - current_media_news_count
         if remaining_slots <= 0 and not force:
             stats["status"] = "skipped"
             stats["reason"] = "max_articles_reached"
-            return stats
+            return [], stats
 
         accepted = self._fetch_and_verify_candidates(
             new_candidates,
@@ -790,13 +811,7 @@ class NewsEnricher:
                 force=force,
             )
 
-        if not accepted and stats.get("already_linked", 0) == 0:
-            stats["status"] = "no_articles"
-            return stats
-
-        stats["new_sources"] = self._handle_enrichment_results(case, accepted, dry_run)
-
-        return stats
+        return accepted, stats
 
     def _search_candidates(self, queries: list[str], stats: dict) -> list[dict]:
         """Execute search queries in parallel and collect deduplicated results."""
@@ -853,31 +868,37 @@ class NewsEnricher:
         Each retry attempt uses a different strategy to maximize the odds of
         finding articles that the primary query variations missed.
         """
+        if attempt == 0:
+            return self._fallback_queries_attempt_0(case)
+        if attempt == 1:
+            return self._fallback_queries_attempt_1(case)
+        return self._fallback_queries_attempt_2(case)
+
+    def _fallback_queries_attempt_0(self, case: Case) -> list[str]:
         accused_names = _get_accused_names(case)
         title = case.title or ""
+        queries = []
+        for name in accused_names[:2]:
+            name_clean = re.sub(r"\s+", " ", name).strip()
+            if name_clean and len(name_clean) >= 3:
+                queries.append(f'"{name_clean}" Nepal')
+        if title and len(title) > 10:
+            queries.append(title[:100])
+        return queries[:5]
 
-        if attempt == 0:
-            # First retry: quoted accused name + Nepal
-            queries = []
-            for name in accused_names[:2]:
-                name_clean = re.sub(r"\s+", " ", name).strip()
-                if name_clean and len(name_clean) >= 3:
-                    queries.append(f'"{name_clean}" Nepal')
-            if title and len(title) > 10:
-                queries.append(title[:100])
-            return queries[:5]
+    def _fallback_queries_attempt_1(self, case: Case) -> list[str]:
+        accused_names = _get_accused_names(case)
+        queries = []
+        for name in accused_names[:2]:
+            name_clean = re.sub(r"\s+", " ", name).strip()
+            if name_clean and len(name_clean) >= 3:
+                queries.append(f"{name_clean} corruption Nepal")
+                queries.append(f"{name_clean} भ्रष्टाचार")
+        return queries[:5]
 
-        if attempt == 1:
-            # Second retry: accused name + "corruption" or "भ्रष्टाचार", no quotes
-            queries = []
-            for name in accused_names[:2]:
-                name_clean = re.sub(r"\s+", " ", name).strip()
-                if name_clean and len(name_clean) >= 3:
-                    queries.append(f"{name_clean} corruption Nepal")
-                    queries.append(f"{name_clean} भ्रष्टाचार")
-            return queries[:5]
-
-        # Third retry: just case title keywords + Nepal
+    def _fallback_queries_attempt_2(self, case: Case) -> list[str]:
+        accused_names = _get_accused_names(case)
+        title = case.title or ""
         title_keywords = _extract_title_keywords(title)
         if title_keywords:
             return [f"{title_keywords} Nepal"]

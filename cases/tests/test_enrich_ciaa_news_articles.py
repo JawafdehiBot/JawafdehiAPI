@@ -139,6 +139,7 @@ class TestNewsEnricherService:
         llm_relevant=True,
         confidence="high",
         reason="Match",
+        summary="",
     ):
         if search_results is None:
             search_results = self._mock_search_results()
@@ -153,11 +154,14 @@ class TestNewsEnricherService:
             "cases.services.news_enricher._fetch_article_content",
             return_value=fetch_html,
         )
-        p3 = patch("requests.post")
-        p3.return_value = self._mock_llm_response(
-            relevant=llm_relevant,
-            confidence=confidence,
-            reason=reason,
+        p3 = patch(
+            "requests.post",
+            return_value=self._mock_llm_response(
+                relevant=llm_relevant,
+                confidence=confidence,
+                reason=reason,
+                summary=summary,
+            ),
         )
         return p1, p2, p3
 
