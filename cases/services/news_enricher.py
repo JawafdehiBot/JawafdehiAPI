@@ -677,7 +677,7 @@ class NewsEnricher:
         Returns stats dict with status and counters.
         """
         api_key = self._resolve_api_key(self.llm_api_key)
-        stats = self._validate_prerequisites(case, api_key, dry_run)
+        stats = self._validate_prerequisites(api_key, dry_run)
         if stats is not None:
             return stats
 
@@ -718,7 +718,7 @@ class NewsEnricher:
         stats["new_sources"] = self._handle_enrichment_results(case, accepted, dry_run)
         return stats
 
-    def _validate_prerequisites(self, case, api_key, dry_run):
+    def _validate_prerequisites(self, api_key, dry_run):
         if not dry_run and not api_key:
             return {
                 "status": "skipped",
