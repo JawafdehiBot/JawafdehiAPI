@@ -608,7 +608,9 @@ def _parse_llm_json(text: str) -> Optional[dict]:
     except json.JSONDecodeError:
         # Strip markdown code fences and retry
         cleaned = re.sub(r"^```(?:json)?[ \t]*", "", text, flags=re.MULTILINE)
-        cleaned = re.sub(r"[ \t]*```[ \t]*$", "", cleaned, flags=re.MULTILINE)
+        if "```" in cleaned:
+            fence_idx = cleaned.rindex("```")
+            cleaned = cleaned[:fence_idx].rstrip()
         try:
             decoder = json.JSONDecoder()
             obj, _end = decoder.raw_decode(cleaned, cleaned.find("{"))
