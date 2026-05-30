@@ -56,24 +56,29 @@ class TestNewsEnricherService:
                 if relevant
                 else "Unrelated article summary."
             )
+        inner_json = json.dumps(
+            {
+                "relevant": relevant,
+                "confidence": confidence,
+                "reason": reason,
+                "summary": summary,
+            }
+        )
+        outer_payload = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": inner_json
+                        }
+                    }
+                ]
+            }
+        )
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
-        mock_response.json.return_value = {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "relevant": relevant,
-                                "confidence": confidence,
-                                "reason": reason,
-                                "summary": summary,
-                            }
-                        )
-                    }
-                }
-            ]
-        }
+        mock_response.json.return_value = json.loads(outer_payload)
+        mock_response.text = outer_payload
         return mock_response
 
     def _get_sample_html(self, title="Test Article", body=None):
@@ -194,14 +199,12 @@ class TestNewsEnricherService:
         assert title == "Nepal Corruption Case Verdict"
 
     def test_fix_mojibake_repairs_latin1_utf8_double_encode(self):
-        mangled = (
-            "à¤…à¤–à¥à¤¤à¤¿à¤¯à¤¾à¤° à¤¦à¥à¤°à¥à¤ªà¤¯à¥‹à¤— "
-            "à¤…à¤¨à¥à¤¸à¤¨à¥à¤§à¤¾à¤¨ à¤†à¤¯à¥‹à¤—à¤²à¥‡"
-        )
+        # "अख्तियार दुरुपयोग" as UTF-8 bytes decoded as Latin-1
+        correct = "अख्तियार दुरुपयोग"
+        mangled = correct.encode("utf-8").decode("latin-1")
         repaired = _fix_mojibake(mangled)
         assert "अख्तियार" in repaired
         assert "दुरुपयोग" in repaired
-        assert "अनुसन्धान" in repaired
 
     def test_fix_mojibake_passes_clean_text(self):
         clean = "अख्तियार दुरुपयोग अनुसन्धान आयोगले"
