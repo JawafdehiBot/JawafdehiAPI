@@ -64,17 +64,7 @@ class TestNewsEnricherService:
                 "summary": summary,
             }
         )
-        outer_payload = json.dumps(
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "content": inner_json
-                        }
-                    }
-                ]
-            }
-        )
+        outer_payload = json.dumps({"choices": [{"message": {"content": inner_json}}]})
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = json.loads(outer_payload)
@@ -436,7 +426,9 @@ class TestNewsEnricherService:
             publication_date=date(2025, 1, 15),
         )
         # Link the source into the case's evidence so the code sees it as already-linked
-        case.evidence = [{"source_id": existing.source_id, "description": "News article"}]
+        case.evidence = [
+            {"source_id": existing.source_id, "description": "News article"}
+        ]
         case.save(update_fields=["evidence"])
 
         enricher = self._create_enricher()
