@@ -159,7 +159,9 @@ class TestSafeRedirectHandler:
         handler = _SafeRedirectHandler()
         req = urllib.request.Request("https://example.com/page")
         with pytest.raises(urllib.error.HTTPError, match="Unsafe redirect"):
-            handler.redirect_request(req, None, 302, "Found", {}, "ftp://evil.com")
+            handler.redirect_request(
+                req, None, 302, "Found", {}, "file:///tmp/evil.txt"
+            )
 
     def test_rejects_empty_host_redirect(self):
         handler = _SafeRedirectHandler()
