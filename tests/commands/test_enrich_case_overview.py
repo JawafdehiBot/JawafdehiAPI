@@ -646,10 +646,6 @@ class TestNormalizeBaseUrl:
 
 
 class TestLlmEndpoint:
-    def test_minimax_uses_messages_endpoint(self):
-        url = _llm_endpoint("https://api.example.com", "minimax-m2.5")
-        assert url.endswith("/messages")
-
     def test_standard_model_uses_chat_completions(self):
         url = _llm_endpoint("https://api.example.com", "claude-sonnet-4-5")
         assert url.endswith("/chat/completions")

@@ -100,7 +100,6 @@ DOWNLOAD_CHUNK_SIZE = 16 * 1024
 DEFAULT_OPENCODE_BASE = "https://opencode.ai/zen/go/v1"
 DEFAULT_LLM_TIMEOUT = 300
 MAX_LLM_RETRIES = 3
-MINIMAX_MODELS = frozenset({"minimax-m2.5", "minimax-m2.7"})
 DEVANAGARI_ALPHABETIC_RE = re.compile(r"[ऄ-हक़-ॡ]")
 ALPHABETIC_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 _CLOUD_METADATA_IP = "169.254.169.254"  # NOSONAR — cloud metadata link-local
@@ -352,8 +351,6 @@ def resolve_api_key(cli_key: str | None = None, is_anthropic: bool = False) -> s
 
 def _llm_endpoint(base_url: str, model: str) -> str:
     base = base_url.rstrip("/")
-    if normalize_model(model) in MINIMAX_MODELS:
-        return f"{base}/messages"
     # OpenAI-compatible endpoint: some proxies (e.g. opencode.ai) include /v1
     # in the base URL; others (bare proxy hosts) don't.  Add /v1/ prefix when
     # the base doesn't already end with a version-segment path.
@@ -1308,30 +1305,20 @@ class Command(BaseCommand):
     ):
         endpoint = _llm_endpoint(base_url, model)
         normalized_model = normalize_model(model)
-        is_minimax = normalized_model in MINIMAX_MODELS
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "User-Agent": "JawafdehiAPI/1.0 enrich_case_overview",
         }
-        if is_minimax:
-            body = {
-                "model": normalized_model,
-                "max_tokens": 6000,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-            }
-        else:
-            body = {
-                "model": normalized_model,
-                "max_tokens": 6000,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.1,
-            }
+        body = {
+            "model": normalized_model,
+            "max_tokens": 6000,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+        }
         data = json.dumps(body).encode("utf-8")
         logger.debug(
             "LLM opencode req: endpoint=%s model=%s prompt_len=%d",
@@ -1352,53 +1339,41 @@ class Command(BaseCommand):
                     type(payload.get("choices")).__name__,
                     str(payload)[:500],
                 )
-                if is_minimax:
-                    content_list = payload.get("content", [])
-                    if not content_list:
-                        logger.warning(
-                            "LLM opencode: attempt %d — empty content list", attempt
-                        )
-                        self.stdout.write(
-                            self.style.WARNING("  LLM returned empty content list")
-                        )
-                        continue
-                    raw = content_list[0].get("text", "")
-                else:
-                    choices = payload.get("choices", [])
-                    if not choices:
-                        logger.warning(
-                            "LLM opencode: attempt %d — empty choices list", attempt
-                        )
-                        self.stdout.write(
-                            self.style.WARNING("  LLM returned empty choices list")
-                        )
-                        continue
-                    choice = choices[0]
-                    logger.debug(
-                        "LLM opencode choice[0] keys=%s type=%s finish_reason=%s",
-                        list(choice.keys()),
-                        choice.get("type", "N/A"),
-                        choice.get("finish_reason", "N/A"),
+                choices = payload.get("choices", [])
+                if not choices:
+                    logger.warning(
+                        "LLM opencode: attempt %d — empty choices list", attempt
                     )
-                    if "message" in choice:
-                        raw = choice["message"].get("content", "")
-                        logger.debug(
-                            "LLM opencode message content length=%d sample=%s",
-                            len(raw),
-                            raw[:100],
-                        )
-                    elif "delta" in choice:
-                        raw = choice["delta"].get("content", "")
-                        logger.warning(
-                            "LLM opencode: choice[0] has delta (streaming) — extracted content=%s",
-                            raw[:100] if raw else "(empty)",
-                        )
-                    else:
-                        raw = choice.get("text", "")
-                        logger.warning(
-                            "LLM opencode: choice[0] has neither message nor delta — using raw=%s",
-                            raw[:100] if raw else "(empty)",
-                        )
+                    self.stdout.write(
+                        self.style.WARNING("  LLM returned empty choices list")
+                    )
+                    continue
+                choice = choices[0]
+                logger.debug(
+                    "LLM opencode choice[0] keys=%s type=%s finish_reason=%s",
+                    list(choice.keys()),
+                    choice.get("type", "N/A"),
+                    choice.get("finish_reason", "N/A"),
+                )
+                if "message" in choice:
+                    raw = choice["message"].get("content", "")
+                    logger.debug(
+                        "LLM opencode message content length=%d sample=%s",
+                        len(raw),
+                        raw[:100],
+                    )
+                elif "delta" in choice:
+                    raw = choice["delta"].get("content", "")
+                    logger.warning(
+                        "LLM opencode: choice[0] has delta (streaming) — extracted content=%s",
+                        raw[:100] if raw else "(empty)",
+                    )
+                else:
+                    raw = choice.get("text", "")
+                    logger.warning(
+                        "LLM opencode: choice[0] has neither message nor delta — using raw=%s",
+                        raw[:100] if raw else "(empty)",
+                    )
                 logger.info(
                     "LLM opencode: attempt %d succeeded — response_len=%d",
                     attempt,
