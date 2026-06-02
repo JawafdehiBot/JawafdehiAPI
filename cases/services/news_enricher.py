@@ -42,7 +42,10 @@ def _truncate_for_regex(html: str) -> str:
 _ALLOWED_HOSTS = frozenset({"ciaa.gov.np", "ngm-store.jawafdehi.org"})
 
 _OFFICIAL_PRESS_RELEASE_PATTERNS = (
-    re.compile(r"^https?://(?:www\.)?ciaa\.gov\.np/pressrelease/", re.IGNORECASE),
+    re.compile(
+        r"^https?://(?:www\.)?ciaa\.gov\.np/(?:index\.php/)?pressrelease/",
+        re.IGNORECASE,
+    ),
 )
 
 _URL_BLOCKLIST_PATTERNS = (
@@ -537,6 +540,7 @@ def _call_llm(
         ],
         "temperature": 0.1,
         "max_tokens": 1200,
+        "stream": False,
     }
 
     last_exc = None
@@ -1386,6 +1390,7 @@ Excerpt: {article_excerpt}"""
             model=self.llm_model,
             base_url=self.llm_base_url,
             api_key=api_key,
+            timeout=120,
         )
 
         if result is None:
