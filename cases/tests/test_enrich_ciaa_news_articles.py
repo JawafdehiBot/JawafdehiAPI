@@ -16,13 +16,24 @@ import pytest
 from django.core.management import call_command
 
 from cases.management.commands.enrich_ciaa_news_articles import Command
-from cases.models import Case, CaseState, CaseType, DocumentSource, SourceType
+from cases.models import (
+    Case,
+    CaseEntityRelationship,
+    CaseState,
+    CaseType,
+    DocumentSource,
+    JawafEntity,
+    RelationshipType,
+    SourceType,
+)
 from cases.services.news_enricher import (
     NewsEnricher,
+    _extract_org_name_from_title,
     _extract_text_from_html,
     _extract_title_from_html,
     _fix_mojibake,
     _generate_query_variations,
+    _get_accused_names,
     _guess_outlet,
     _parse_llm_json,
 )
@@ -188,9 +199,43 @@ class TestNewsEnricherService:
 
         queries = _generate_query_variations(case)
 
-        assert len(queries) <= 10
+        assert len(queries) <= 15
         assert any("मुद्दा दायर" in query for query in queries)
         assert any("फैसला विशेष अदालत" in query for query in queries)
+
+    def test_generate_query_variations_cap_is_15(self):
+        case = self._create_case(
+            title="लामो शीर्षक भ्रष्टाचार अनियमितता घुस रकम जग्गा खरिद निर्माण ठेक्का",
+            court_cases=["special:080-CR-0007"],
+            case_start_date=date(2023, 7, 1),
+            case_end_date=date(2024, 6, 12),
+            key_allegations=["घुस रिश्वत भ्रष्टाचार अनियमितता अकुत सम्पत्ति"],
+        )
+        queries = _generate_query_variations(case)
+        assert len(queries) <= 15
+
+    def test_extract_org_name_from_title(self):
+        title = "नेपाल सरकार विरुद्ध साझा भण्डार सहकारी संस्था लिमिटेड मुद्दा"
+        org = _extract_org_name_from_title(title)
+        assert org == "साझा भण्डार सहकारी संस्था लिमिटेड"
+
+    def test_extract_org_name_from_title_no_match(self):
+        assert _extract_org_name_from_title("") == ""
+        assert _extract_org_name_from_title("राम विरुद्ध श्याम मुद्दा") == ""
+
+    def test_get_accused_names_from_entity_relationships(self):
+        case = self._create_case()
+        entity = JawafEntity.objects.create(display_name="गोपाल पराजुली")
+        CaseEntityRelationship.objects.create(
+            case=case, entity=entity, relationship_type=RelationshipType.ACCUSED
+        )
+        names = _get_accused_names(case)
+        assert "गोपाल पराजुली" in names
+
+    def test_event_cap_constant(self):
+        from cases.services.news_enricher import _MAX_ARTICLES_PER_EVENT_TYPE
+
+        assert _MAX_ARTICLES_PER_EVENT_TYPE == 2
 
     def test_extract_text_from_html(self):
         html = self._get_sample_html(body="This is article content. " * 20)

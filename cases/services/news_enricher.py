@@ -16,7 +16,7 @@ from urllib.parse import quote_plus, urlparse
 import requests
 from django.db import close_old_connections, transaction
 
-from cases.models import Case, DocumentSource, SourceType
+from cases.models import Case, CaseEntityRelationship, DocumentSource, RelationshipType, SourceType
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,8 @@ _ALL_EVENT_TYPES = (
     _EVENT_VERDICT,
     _EVENT_APPEAL,
 )
+
+_MAX_ARTICLES_PER_EVENT_TYPE = 2
 
 _EVENT_QUERY_TEMPLATES: dict[str, list[str]] = {
     _EVENT_INVESTIGATION: [
@@ -328,10 +330,10 @@ def _generate_query_variations(case: Case) -> list[str]:
     reserved_event_slots = min(4, len(deduped_events))
     combined = (
         deduped_events[:reserved_event_slots]
-        + deduped_general[: 10 - reserved_event_slots]
+        + deduped_general[: 15 - reserved_event_slots]
         + deduped_events[reserved_event_slots:]
     )
-    return _deduplicate_queries(combined, case_number, _get_accused_names(case))[:10]
+    return _deduplicate_queries(combined, case_number, _get_accused_names(case))[:15]
 
 
 def _append_title_keyword_query(queries: list[str], title: str) -> None:
@@ -496,6 +498,7 @@ def _build_name_based_queries(case: Case) -> list[str]:
     title = case.title or ""
 
     location = _extract_location_from_title(title)
+    org_name = _extract_org_name_from_title(title)
 
     for name in accused_names[:3]:
         name_clean = re.sub(r"\s+", " ", name).strip()
@@ -508,7 +511,39 @@ def _build_name_based_queries(case: Case) -> list[str]:
         queries.append(f'"{name_clean}" अख्तियार')
         queries.append(f"{name_clean} CIAA corruption")
 
+    if org_name:
+        queries.append(f"{org_name} भ्रष्टाचार")
+        queries.append(f"{org_name} अख्तियार")
+
     return queries
+
+
+def _extract_org_name_from_title(title: str) -> str:
+    """Extract organization name from case title for search queries."""
+    if not title:
+        return ""
+    suffixes = (
+        "सहकारी",
+        "संस्था",
+        "कम्पनी",
+        "स्कुल",
+        "कलेज",
+        "अस्पताल",
+        "बैंक",
+        "विकास बैंक",
+        "फाइनान्स",
+        "जलस्रोत",
+        "खानेपानी",
+        "उपभोक्ता समिति",
+        "विद्युत",
+        "सिंचाइ",
+        "निर्माण सेवा",
+    )
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        m = re.search(rf"(\S{{2,60}}\s*{re.escape(suffix)})", title)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
 def _extract_location_from_title(title: str) -> str:
@@ -538,8 +573,23 @@ def _extract_title_keywords(title: str) -> str:
 
 
 def _get_accused_names(case: Case) -> list[str]:
-    """Extract accused entity names from a case."""
+    """Extract accused entity names from a case, preferring DB entity relationships."""
     names = []
+    try:
+        accused_rels = CaseEntityRelationship.objects.filter(
+            case=case, relationship_type=RelationshipType.ACCUSED
+        ).select_related("entity")
+        for rel in accused_rels:
+            entity_name = rel.entity.display_name or rel.entity.nes_id or ""
+            name_clean = entity_name.strip()
+            if name_clean:
+                names.append(name_clean)
+    except Exception:
+        pass
+
+    if names:
+        return names[:5]
+
     if case.title:
         match = re.search(
             r"(?:विरुद्ध|vs\.?|versus)\s+(.{1,200})(?:\s+मुद्दा|\s+मा\.?\s|$)",
@@ -1174,7 +1224,14 @@ class NewsEnricher:
 
         accepted = []
         accepted_event_types: set[str] = set()
+        event_type_counts: dict[str, int] = {}
         deferred: list[dict] = []
+
+        def _would_exceed_event_cap(event: str) -> bool:
+            return (
+                event
+                and event_type_counts.get(event, 0) >= _MAX_ARTICLES_PER_EVENT_TYPE
+            )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_result = {}
@@ -1205,6 +1262,7 @@ class NewsEnricher:
                     if event and event not in accepted_event_types:
                         accepted.append(verified)
                         accepted_event_types.add(event)
+                        event_type_counts[event] = event_type_counts.get(event, 0) + 1
                         stats["accepted"] += 1
                         logger.info(
                             "  Accepted: %s (event: %s, confidence: %s)",
@@ -1220,7 +1278,8 @@ class NewsEnricher:
                             verified["url"][:80],
                         )
 
-        # Fill remaining slots from deferred, preferring unique events
+        # Fill remaining slots from deferred, preferring unique events, capped at
+        # _MAX_ARTICLES_PER_EVENT_TYPE per event type.
         remaining = limit - len(accepted)
         for verified in deferred:
             if remaining <= 0:
@@ -1229,6 +1288,7 @@ class NewsEnricher:
             if event and event not in accepted_event_types:
                 accepted.append(verified)
                 accepted_event_types.add(event)
+                event_type_counts[event] = event_type_counts.get(event, 0) + 1
                 stats["accepted"] += 1
                 remaining -= 1
                 logger.info(
@@ -1238,17 +1298,24 @@ class NewsEnricher:
                     verified["confidence"],
                 )
 
-        # Still have slots — accept duplicates
+        # Fill remaining slots from deferred, allowing same event type but
+        # capped at _MAX_ARTICLES_PER_EVENT_TYPE. Duplicate event types beyond
+        # the cap are left unfilled — future re-runs will fill them when
+        # hearing/verdict coverage exists.
         for verified in deferred:
             if remaining <= 0:
                 break
+            event = verified.get("event_type", "")
+            if event and _would_exceed_event_cap(event):
+                continue
             accepted.append(verified)
+            event_type_counts[event] = event_type_counts.get(event, 0) + 1
             stats["accepted"] += 1
             remaining -= 1
             logger.info(
-                "  Accepted (fallback dup): %s (event: %s, confidence: %s)",
+                "  Accepted (same event): %s (event: %s, confidence: %s)",
                 verified["url"][:80],
-                verified.get("event_type", ""),
+                event,
                 verified["confidence"],
             )
 
