@@ -27,14 +27,14 @@ from cases.models import (
     SourceType,
 )
 from cases.services.news_enricher import (
-    NewsEnricher,
-    _detect_case_events,
     _EVENT_APPEAL,
     _EVENT_FILING,
     _EVENT_HEARING,
     _EVENT_INVESTIGATION,
     _EVENT_QUERY_TEMPLATES,
     _EVENT_VERDICT,
+    NewsEnricher,
+    _detect_case_events,
     _extract_org_name_from_title,
     _extract_text_from_html,
     _extract_title_from_html,

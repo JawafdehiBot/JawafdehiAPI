@@ -18,7 +18,7 @@ import os
 
 from django.core.management.base import BaseCommand
 
-from cases.models import Case, CaseType, CaseState
+from cases.models import Case, CaseState, CaseType
 from cases.services.news_enricher import NewsEnricher, enrich_cases_batch
 from cases.services.priority_case_loader import filter_by_priority, load_priority_cases
 
