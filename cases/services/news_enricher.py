@@ -335,20 +335,28 @@ def _generate_query_variations(case: Case) -> list[str]:
     event_queries: list[str] = []
     _append_event_targeted_queries(event_queries, case)
 
+    english_queries: list[str] = []
+    _append_english_name_queries(english_queries, accused_names)
+
     general_queries = _build_name_based_queries(case)
-    _append_english_name_queries(general_queries, accused_names)
     _append_title_keyword_query(general_queries, title)
     _append_accused_corruption_queries(general_queries, case)
     _append_location_queries(general_queries, case, title)
 
+    deduped_english = _deduplicate_queries(english_queries, case_number, accused_names)
     deduped_events = _deduplicate_queries(event_queries, case_number, accused_names)
     deduped_general = _deduplicate_queries(general_queries, case_number, accused_names)
 
+    reserved_english_slots = min(4, len(deduped_english))
     reserved_event_slots = min(4, len(deduped_events))
+    general_slots = 15 - reserved_english_slots - reserved_event_slots
+
     combined = (
-        deduped_events[:reserved_event_slots]
-        + deduped_general[: 15 - reserved_event_slots]
+        deduped_english[:reserved_english_slots]
+        + deduped_events[:reserved_event_slots]
+        + deduped_general[:general_slots]
         + deduped_events[reserved_event_slots:]
+        + deduped_english[reserved_english_slots:]
     )
     return _normalize_search_queries(
         _deduplicate_queries(combined, case_number, accused_names)
