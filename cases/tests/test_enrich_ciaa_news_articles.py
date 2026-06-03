@@ -313,7 +313,9 @@ class TestNewsEnricherService:
                 [{"url": "https://example.com/2", "title": "two", "snippet": ""}],
                 [{"url": "https://example.com/1", "title": "dup", "snippet": ""}],
             ],
-        ) as search_mock, patch("cases.services.news_enricher.time.sleep") as sleep_mock:
+        ) as search_mock, patch(
+            "cases.services.news_enricher.time.sleep"
+        ) as sleep_mock:
             results = enricher._search_candidates(queries, stats)
 
         assert search_mock.call_count == 3

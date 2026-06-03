@@ -1234,7 +1234,11 @@ class NewsEnricher:
                     continue
                 if verified:
                     event = verified.get("event_type", "")
-                    if event and event not in accepted_event_types and not _would_exceed_event_cap(event):
+                    if (
+                        event
+                        and event not in accepted_event_types
+                        and not _would_exceed_event_cap(event)
+                    ):
                         accepted.append(verified)
                         accepted_event_types.add(event)
                         event_type_counts[event] = event_type_counts.get(event, 0) + 1
@@ -1260,7 +1264,11 @@ class NewsEnricher:
             if remaining <= 0:
                 break
             event = verified.get("event_type", "")
-            if event and event not in accepted_event_types and not _would_exceed_event_cap(event):
+            if (
+                event
+                and event not in accepted_event_types
+                and not _would_exceed_event_cap(event)
+            ):
                 accepted.append(verified)
                 accepted_event_types.add(event)
                 event_type_counts[event] = event_type_counts.get(event, 0) + 1
@@ -2010,7 +2018,9 @@ Excerpt: {article_excerpt}"""
                 new_count += 1
 
                 if source.source_id not in existing_source_ids:
-                    evidence.append(self._build_evidence_entry(source.source_id, article))
+                    evidence.append(
+                        self._build_evidence_entry(source.source_id, article)
+                    )
                     existing_source_ids.add(source.source_id)
 
             case.evidence = evidence
