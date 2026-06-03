@@ -322,7 +322,9 @@ def _resolve_case_number(case: Case) -> Optional[str]:
     return None
 
 
-def _generate_query_variations(case: Case) -> list[str]:
+def _generate_query_variations(
+    case: Case, llm_english_queries: Optional[list[str]] = None
+) -> list[str]:
     """Generate search query variations for a CIAA case.
 
     Prioritizes accused name + location + corruption keywords over case numbers,
@@ -336,7 +338,10 @@ def _generate_query_variations(case: Case) -> list[str]:
     _append_event_targeted_queries(event_queries, case)
 
     english_queries: list[str] = []
-    _append_english_name_queries(english_queries, accused_names)
+    if llm_english_queries:
+        english_queries.extend(llm_english_queries)
+    else:
+        _append_english_name_queries(english_queries, accused_names)
 
     general_queries = _build_name_based_queries(case)
     _append_title_keyword_query(general_queries, title)
@@ -1010,13 +1015,6 @@ class NewsEnricher:
         if self._is_already_saturated(case, force):
             return self._make_stats("skipped", "already_saturated")
 
-        queries = _generate_query_variations(case)
-        if not queries:
-            logger.info("  No search queries generated")
-            stats = self._make_stats("skipped")
-            stats["reason"] = "no_queries"
-            return stats
-
         press_release_text = self._get_press_release_content(case)
         if press_release_text:
             logger.info(
@@ -1026,6 +1024,19 @@ class NewsEnricher:
             logger.warning(
                 "  WARNING: no press release text — LLM verification will lack official case context"
             )
+
+        llm_english_queries = self._generate_english_queries_via_llm(
+            case, press_release_text
+        )
+
+        queries = _generate_query_variations(
+            case, llm_english_queries=llm_english_queries
+        )
+        if not queries:
+            logger.info("  No search queries generated")
+            stats = self._make_stats("skipped")
+            stats["reason"] = "no_queries"
+            return stats
 
         accepted, stats = self._perform_enrichment(
             case, queries, api_key, case_linked_urls, press_release_text, force
@@ -1845,6 +1856,75 @@ class NewsEnricher:
                     if et in event_counts:
                         parts.append(f"{et}={event_counts[et]}")
                 logger.info("  Event coverage (accepted in run): %s", ", ".join(parts))
+
+    def _generate_english_queries_via_llm(
+        self, case: Case, press_release_text: Optional[str]
+    ) -> list[str]:
+        """Use LLM to generate correctly romanized English search queries.
+
+        The character-map romanizer produces broken transliterations
+        (वहादुर → wahadur instead of Bahadur). LLM knows correct spelling.
+
+        Returns 3 English queries with correctly romanized names and
+        event-specific phrasing. On any failure, returns empty list so
+        caller falls back to romanization path.
+        """
+        api_key = self._resolve_api_key(self.llm_api_key)
+        if not api_key or not self.llm_base_url:
+            return []
+
+        case_title = case.title or "Unknown"
+        case_context = f"Case Title: {case_title}"
+        if press_release_text:
+            case_context += f"\n\nPress Release: {press_release_text[:500]}"
+
+        user_prompt = (
+            "Generate 3 English search queries to find Nepali news articles "
+            "about this CIAA corruption case. "
+            "Use correct English romanization of Nepali names (e.g. Bahadur not wahadur, Bisht not wisht). "
+            "Make each query event-specific (investigation, chargesheet, court hearing, verdict, appeal). "
+            "Include the word Nepal in each query. "
+            'Respond with ONLY: {"queries": ["query 1", "query 2", "query 3"]}\n\n'
+            f"{case_context}"
+        )
+
+        try:
+            result = _call_llm(
+                system_prompt="You are a Nepal-focused news search assistant. Output only clean search queries.",
+                user_prompt=user_prompt,
+                model=self.llm_model,
+                base_url=self.llm_base_url,
+                api_key=api_key,
+                timeout=30,
+                max_retries=1,
+            )
+        except Exception:
+            logger.debug("LLM English query generation failed", exc_info=True)
+            return []
+
+        if result is None:
+            return []
+
+        queries = result.get("queries") if isinstance(result, dict) else None
+        if not isinstance(queries, list):
+            return []
+
+        english_queries = [
+            q
+            for q in queries
+            if isinstance(q, str) and _is_english_query(q) and len(q) > 10
+        ][:3]
+
+        if english_queries:
+            logger.info(
+                "  LLM generated %d English queries (e.g. %s)",
+                len(english_queries),
+                english_queries[0][:80],
+            )
+        else:
+            logger.debug("  LLM English queries empty or unparseable")
+
+        return english_queries
 
     def _verify_article_relevance(
         self,
