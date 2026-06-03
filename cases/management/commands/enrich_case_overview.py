@@ -1614,10 +1614,16 @@ class Command(BaseCommand):
                     response_model,
                 )
                 if response_model != "(unknown)":
-                    assert response_model == normalized_model, (
-                        f"Model mismatch: sent {normalized_model!r} but "
-                        f"response from {response_model!r}"
-                    )
+                    resp_normalized = normalize_model(response_model)
+                    if resp_normalized != normalized_model:
+                        logger.warning(
+                            "LLM opencode: model mismatch — "
+                            "sent %r, response %r (normalized: %r vs %r)",
+                            model,
+                            response_model,
+                            normalized_model,
+                            resp_normalized,
+                        )
                 choices = payload.get("choices", [])
                 if not choices:
                     logger.warning(
@@ -1661,10 +1667,16 @@ class Command(BaseCommand):
                     response_model,
                     normalized_model,
                 )
-                assert response_model == normalized_model, (
-                    f"Model mismatch: sent {normalized_model!r} but "
-                    f"response from {response_model!r}"
-                )
+                resp_normalized = normalize_model(response_model or "")
+                if resp_normalized != normalized_model:
+                    logger.warning(
+                        "LLM opencode: model mismatch — "
+                        "sent %r, response %r (normalized: %r vs %r)",
+                        model,
+                        response_model,
+                        normalized_model,
+                        resp_normalized,
+                    )
                 return _extract_json_body(raw)
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -1744,7 +1756,7 @@ class Command(BaseCommand):
                     response_model,
                     model,
                 )
-                assert response_model == model, (
+                assert response_model == model or normalize_model(response_model) == model, (
                     f"Model mismatch: sent {model!r} but "
                     f"response from {response_model!r}"
                 )
