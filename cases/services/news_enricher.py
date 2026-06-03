@@ -77,6 +77,45 @@ def _is_url_blocklisted(url: str) -> Optional[str]:
     return None
 
 
+# Event types in a CIAA corruption case lifecycle
+_EVENT_INVESTIGATION = "investigation"
+_EVENT_FILING = "filing"
+_EVENT_HEARING = "hearing"
+_EVENT_VERDICT = "verdict"
+_EVENT_APPEAL = "appeal"
+
+_ALL_EVENT_TYPES = (
+    _EVENT_INVESTIGATION,
+    _EVENT_FILING,
+    _EVENT_HEARING,
+    _EVENT_VERDICT,
+    _EVENT_APPEAL,
+)
+
+_EVENT_QUERY_TEMPLATES: dict[str, list[str]] = {
+    _EVENT_INVESTIGATION: [
+        "{name} अख्तियार अनुसन्धान",
+        "{name} CIAA investigation",
+    ],
+    _EVENT_FILING: [
+        "{name} अख्तियार मुद्दा दायर",
+        "{name} CIAA charge sheet special court",
+    ],
+    _EVENT_HEARING: [
+        "{name} सुनुवाइ विशेष अदालत",
+        "{name} hearing special court corruption",
+    ],
+    _EVENT_VERDICT: [
+        "{name} फैसला विशेष अदालत",
+        "{name} verdict special court corruption",
+        "{name} ठहर भ्रष्टाचार",
+    ],
+    _EVENT_APPEAL: [
+        "{name} पुनरावेदन सर्वोच्च",
+        "{name} supreme court appeal corruption",
+    ],
+}
+
 _VERIFY_SYSTEM_PROMPT = """\
 You are a fact-checking assistant for a Nepal corruption accountability platform.
 Your job is to determine whether a given news article is genuinely about the same
@@ -85,10 +124,17 @@ CIAA Special Court corruption case as the case described below.
 You must respond with ONLY a JSON object in one of these two formats:
 
 If the article IS about the same case:
-{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case.", "summary": "A concise 1-3 sentence summary of what the news article reports (who is involved, what happened, key facts, timeline). Write this as a public-facing article description, not as a matching rationale."}
+{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case.", "summary": "A concise 1-3 sentence summary of what the news article reports (who is involved, what happened, key facts, timeline). Write this as a public-facing article description, not as a matching rationale.", "event_type": "investigation|filing|hearing|verdict|appeal"}
 
 If the article is NOT about the same case:
 {"relevant": false, "reason": "Brief explanation in English of why this article does not match.", "summary": "A concise 1-3 sentence summary of what the news article reports."}
+
+Event types for the "event_type" field:
+- "investigation" — CIAA is investigating or completed investigation phase
+- "filing" — CIAA filed the charge sheet at Special Court
+- "hearing" — court hearing, proceedings, or bench session coverage
+- "verdict" — Special Court verdict, decision, or conviction
+- "appeal" — Supreme Court appeal or review
 
 Rules:
 - The article must reference the same corruption case, not just mention the same person in an unrelated context.
@@ -97,6 +143,7 @@ Rules:
 - If the article is about a different corruption case involving the same person, it is NOT relevant.
 - If the article is about the same person but not about corruption allegations, it is NOT relevant.
 - The "summary" field should describe the article content itself, not how the LLM matched it to the case.
+- The "event_type" field should identify which stage of the case lifecycle the article covers. Use your best judgment based on article content. If unclear, default to "filing".
 """
 
 
@@ -267,6 +314,7 @@ def _generate_query_variations(case: Case) -> list[str]:
     _append_title_keyword_query(queries, title)
     _append_accused_corruption_queries(queries, case)
     _append_location_queries(queries, case, title)
+    _append_event_targeted_queries(queries, case)
 
     deduped = _deduplicate_queries(queries, case_number, _get_accused_names(case))
     return deduped[:10]
@@ -302,6 +350,109 @@ def _append_location_queries(queries: list[str], case: Case, title: str) -> None
     if location:
         queries.append(f"{name_clean} {location} भ्रष्टाचार")
         queries.append(f"{name_clean} {location} अख्तियार")
+
+
+def _append_event_targeted_queries(queries: list[str], case: Case) -> None:
+    """Generate event-targeted search queries from court case lifecycle data.
+
+    Uses NGM hearing data when available; falls back to court_cases field
+    to detect special/supreme court entries and case_start/end_dates.
+
+    NGM integration is optional — failures are silent and fall back to
+    field-based detection.
+    """
+    accused_names = _get_accused_names(case)
+    if not accused_names:
+        return
+    name_clean = re.sub(r"\s+", " ", accused_names[0]).strip()
+    if not name_clean or len(name_clean) < 3:
+        return
+
+    detected_events = _detect_case_events(case)
+    for event_type in detected_events:
+        templates = _EVENT_QUERY_TEMPLATES.get(event_type, [])
+        for template in templates:
+            queries.append(template.format(name=name_clean))
+
+
+def _detect_case_events(case: Case) -> list[str]:
+    """Detect which lifecycle events exist for this case.
+
+    Uses NGM hearing data when available to detect hearings, verdicts.
+    Falls back to court_cases field analysis for special/supreme detection
+    and case_start_date / case_end_date for investigation/filing signals.
+
+    NGM failures are silent — returns [] on any error, which means
+    the enricher uses only general queries (current behavior).
+    """
+    events = []
+
+    has_special = False
+    has_supreme = False
+    if case.court_cases:
+        for cc in case.court_cases:
+            if isinstance(cc, str) and ":" in cc:
+                court_id, _ = cc.split(":", 1)
+                if court_id.lower() == "special":
+                    has_special = True
+                elif court_id.lower() == "supreme":
+                    has_supreme = True
+
+    if has_special:
+        events.append(_EVENT_FILING)
+
+    hearing_data = _fetch_ngm_hearing_data(case)
+    if hearing_data is not None:
+        verdict_found = False
+        hearing_found = False
+        for h in hearing_data.get("hearings", []):
+            decision = (h.get("decision_type") or "").lower()
+            status = (h.get("case_status") or "").lower()
+            if any(kw in decision for kw in ("फैसला", "verdict", "judgment", "decision")):
+                verdict_found = True
+            if any(kw in status for kw in ("सुनुवाइ", "hearing", "पेशी")):
+                hearing_found = True
+        if verdict_found:
+            events.append(_EVENT_VERDICT)
+        if hearing_found or hearing_data.get("hearings"):
+            events.append(_EVENT_HEARING)
+    else:
+        if has_special:
+            events.append(_EVENT_HEARING)
+
+    if has_supreme:
+        events.append(_EVENT_APPEAL)
+
+    if case.case_start_date:
+        events.append(_EVENT_INVESTIGATION)
+
+    return events
+
+
+def _fetch_ngm_hearing_data(case: Case) -> Optional[dict]:
+    """Fetch NGM hearing data for a case. Returns None on any failure."""
+    court_case_numbers = []
+    if case.court_cases:
+        for cc in case.court_cases:
+            if isinstance(cc, str) and ":" in cc:
+                court_case_numbers.append(cc)
+    if not court_case_numbers:
+        return None
+
+    try:
+        from ngm.services import get_court_case_details
+    except ImportError:
+        return None
+
+    for cc_str in court_case_numbers:
+        court_id, case_num = cc_str.split(":", 1)
+        try:
+            details = get_court_case_details(court_id.strip(), case_num.strip())
+            if details:
+                return details
+        except (ValueError, Exception):
+            continue
+    return None
 
 
 def _deduplicate_queries(
@@ -1008,6 +1159,9 @@ class NewsEnricher:
         )
 
         accepted = []
+        accepted_event_types: set[str] = set()
+        deferred: list[dict] = []
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_result = {}
             for result in fetched:
@@ -1033,13 +1187,57 @@ class NewsEnricher:
                     stats["errors"] += 1
                     continue
                 if verified:
-                    accepted.append(verified)
-                    stats["accepted"] += 1
-                    logger.info(
-                        "  Accepted: %s (confidence: %s)",
-                        verified["url"][:80],
-                        verified["confidence"],
-                    )
+                    event = verified.get("event_type", "")
+                    if event and event not in accepted_event_types:
+                        accepted.append(verified)
+                        accepted_event_types.add(event)
+                        stats["accepted"] += 1
+                        logger.info(
+                            "  Accepted: %s (event: %s, confidence: %s)",
+                            verified["url"][:80],
+                            event,
+                            verified["confidence"],
+                        )
+                    else:
+                        deferred.append(verified)
+                        logger.debug(
+                            "  Deferred (duplicate event %s): %s",
+                            event or "unknown",
+                            verified["url"][:80],
+                        )
+
+        # Fill remaining slots from deferred, preferring unique events
+        remaining = limit - len(accepted)
+        for verified in deferred:
+            if remaining <= 0:
+                break
+            event = verified.get("event_type", "")
+            if event and event not in accepted_event_types:
+                accepted.append(verified)
+                accepted_event_types.add(event)
+                stats["accepted"] += 1
+                remaining -= 1
+                logger.info(
+                    "  Accepted (deferred): %s (event: %s, confidence: %s)",
+                    verified["url"][:80],
+                    event,
+                    verified["confidence"],
+                )
+
+        # Still have slots — accept duplicates
+        for verified in deferred:
+            if remaining <= 0:
+                break
+            accepted.append(verified)
+            stats["accepted"] += 1
+            remaining -= 1
+            logger.info(
+                "  Accepted (fallback dup): %s (event: %s, confidence: %s)",
+                verified["url"][:80],
+                verified.get("event_type", ""),
+                verified["confidence"],
+            )
+
         return accepted
 
     def _fetch_candidates_parallel(
@@ -1119,7 +1317,7 @@ class NewsEnricher:
         article_title = fetch_result["article_title"]
 
         if api_key and self.llm_base_url:
-            is_relevant, confidence, reason, summary = self._verify_article_relevance(
+            is_relevant, confidence, reason, summary, event_type = self._verify_article_relevance(
                 case=case,
                 article_title=article_title,
                 article_url=url,
@@ -1132,6 +1330,7 @@ class NewsEnricher:
             confidence = "none"
             reason = "LLM not configured"
             summary = ""
+            event_type = ""
 
         if not is_relevant:
             stats["rejected"] += 1
@@ -1148,6 +1347,7 @@ class NewsEnricher:
             "confidence": confidence,
             "reason": reason,
             "summary": summary,
+            "event_type": event_type or "",
         }
 
     @staticmethod
@@ -1294,11 +1494,12 @@ class NewsEnricher:
                 logger.info("    - %s", a["url"][:80])
             new_sources = len(accepted)
 
-        self._log_case_article_summary(case, pre_existing, new_sources)
+        self._log_case_article_summary(case, pre_existing, new_sources, accepted)
         return new_sources
 
     def _log_case_article_summary(
-        self, case: Case, pre_existing: int, new_sources: int
+        self, case: Case, pre_existing: int, new_sources: int,
+        accepted: Optional[list[dict]] = None,
     ) -> None:
         """Log the final news article state for a case after enrichment."""
         source_ids = self._extract_source_ids_from_evidence(case.evidence)
@@ -1335,6 +1536,24 @@ class NewsEnricher:
             )
             logger.info("    - %s | %s", s.title or "Untitled", url_str)
 
+        if accepted:
+            event_counts: dict[str, int] = {}
+            event_examples: dict[str, str] = {}
+            for a in accepted:
+                et = a.get("event_type", "")
+                if et:
+                    event_counts[et] = event_counts.get(et, 0) + 1
+                    if et not in event_examples:
+                        event_examples[et] = a.get("title", "")[:60]
+            if event_counts:
+                parts = []
+                for et in _ALL_EVENT_TYPES:
+                    if et in event_counts:
+                        parts.append(f"{et}={event_counts[et]}")
+                logger.info(
+                    "  Event coverage (accepted in run): %s", ", ".join(parts)
+                )
+
     def _verify_article_relevance(
         self,
         case: Case,
@@ -1343,7 +1562,7 @@ class NewsEnricher:
         article_excerpt: str,
         api_key: str,
         press_release_text: Optional[str] = None,
-    ) -> tuple[bool, str, str, str]:
+    ) -> tuple[bool, str, str, str, str]:
         """Use LLM to verify if an article is about the same case.
 
         Returns (is_relevant, confidence, reason, summary).
@@ -1394,22 +1613,24 @@ Excerpt: {article_excerpt}"""
         )
 
         if result is None:
-            return False, "error", "LLM response could not be parsed", ""
+            return False, "error", "LLM response could not be parsed", "", ""
 
         relevant = result.get("relevant", False)
         confidence = result.get("confidence", "medium")
         reason = result.get("reason", "")
         summary = result.get("summary", "")
+        event_type = result.get("event_type", "")
 
         logger.debug(
-            "LLM verdict for %s: relevant=%s confidence=%s reason=%s",
+            "LLM verdict for %s: relevant=%s confidence=%s event=%s reason=%s",
             article_url[:80],
             relevant,
             confidence,
+            event_type or "none",
             reason,
         )
 
-        return relevant, confidence, reason, summary
+        return relevant, confidence, reason, summary, event_type
 
     def _get_press_release_content(self, case: Case) -> Optional[str]:
         """Extract press release text for a CIAA case from evidence-linked sources.
