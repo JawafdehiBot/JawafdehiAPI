@@ -604,8 +604,6 @@ def _build_name_based_queries(case: Case) -> list[str]:
             if location:
                 queries.append(f'"{name_clean}" {location} भ्रष्टाचार')
                 queries.append(f"{name_clean} {location} अख्तियार")
-            queries.append(f'"{name_clean}" भ्रष्टाचार')
-            queries.append(f'"{name_clean}" अख्तियार')
             queries.append(f"{name_clean} CIAA corruption")
         else:
             queries.append(f"{name_clean} CIAA corruption Nepal")
@@ -1865,26 +1863,25 @@ class NewsEnricher:
         The character-map romanizer produces broken transliterations
         (वहादुर → wahadur instead of Bahadur). LLM knows correct spelling.
 
-        Returns 3 English queries with correctly romanized names and
-        event-specific phrasing. On any failure, returns empty list so
-        caller falls back to romanization path.
+        Returns up to 5 English queries (one per event type) with correctly
+        romanized names. On any failure, returns empty list so caller falls
+        back to romanization path.
         """
         api_key = self._resolve_api_key(self.llm_api_key)
         if not api_key or not self.llm_base_url:
             return []
 
-        case_title = case.title or "Unknown"
-        case_context = f"Case Title: {case_title}"
-        if press_release_text:
-            case_context += f"\n\nPress Release: {press_release_text[:500]}"
+        accused_names = _get_accused_names(case)
+        name_list = ", ".join(accused_names[:3]) if accused_names else "Unknown"
+        case_context = f"Case Title: {case.title or 'Unknown'}\nAccused: {name_list}"
 
         user_prompt = (
-            "Generate 3 English search queries to find Nepali news articles "
-            "about this CIAA corruption case. "
+            "Generate 5 English search queries to find Nepali news articles "
+            "about this CIAA corruption case. One query per event type: "
+            "investigation, chargesheet filing, court hearing, verdict, appeal. "
             "Use correct English romanization of Nepali names (e.g. Bahadur not wahadur, Bisht not wisht). "
-            "Make each query event-specific (investigation, chargesheet, court hearing, verdict, appeal). "
             "Include the word Nepal in each query. "
-            'Respond with ONLY: {"queries": ["query 1", "query 2", "query 3"]}\n\n'
+            'Respond with ONLY: {"queries": ["q1", "q2", "q3", "q4", "q5"]}\n\n'
             f"{case_context}"
         )
 
@@ -1913,7 +1910,7 @@ class NewsEnricher:
             q
             for q in queries
             if isinstance(q, str) and _is_english_query(q) and len(q) > 10
-        ][:3]
+        ][:5]
 
         if english_queries:
             logger.info(
