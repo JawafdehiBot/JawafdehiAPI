@@ -1054,14 +1054,18 @@ class Command(BaseCommand):
             else "(No press releases available)"
         )
 
-        court_text = (
-            "\n\n---\n\n".join(
-                f"Court Order {i+1}:\n{t}"
-                for i, t in enumerate(source_texts["court_orders"])
-            )
-            if source_texts["court_orders"]
-            else "(No court orders available)"
-        )
+        truncated_orders = [t[:5000] for t in source_texts["court_orders"]]
+        court_joined = ""
+        court_total = 0
+        for i, t in enumerate(truncated_orders):
+            header = f"Court Order {i+1}:\n"
+            sep = "\n\n---\n\n" if court_joined else ""
+            chunk = sep + header + t
+            if court_total + len(chunk) > 15000:
+                break
+            court_joined += chunk
+            court_total += len(chunk)
+        court_text = court_joined if court_joined else "(No court orders available)"
 
         investigative_text = (
             "\n\n---\n\n".join(
@@ -1348,6 +1352,17 @@ class Command(BaseCommand):
                     type(payload.get("choices")).__name__,
                     str(payload)[:500],
                 )
+                response_model = payload.get("model") or "(unknown)"
+                logger.info(
+                    "LLM opencode: requested_model=%s response_model=%s",
+                    normalized_model,
+                    response_model,
+                )
+                if response_model != "(unknown)":
+                    assert response_model == normalized_model, (
+                        f"Model mismatch: sent {normalized_model!r} but "
+                        f"response from {response_model!r}"
+                    )
                 choices = payload.get("choices", [])
                 if not choices:
                     logger.warning(
