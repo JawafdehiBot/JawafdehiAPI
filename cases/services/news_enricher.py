@@ -98,7 +98,17 @@ _ALL_EVENT_TYPES = (
     _EVENT_APPEAL,
 )
 
-_MAX_ARTICLES_PER_EVENT_TYPE = 2
+_EVENT_OTHER = "other"
+_EVENT_LIFECYCLE_ORDER = {
+    _EVENT_INVESTIGATION: 1,
+    _EVENT_FILING: 2,
+    _EVENT_HEARING: 3,
+    _EVENT_VERDICT: 4,
+    _EVENT_APPEAL: 5,
+    _EVENT_OTHER: 6,
+}
+
+_MAX_ARTICLES_PER_EVENT_TYPE = 1
 
 _EVENT_QUERY_TEMPLATES: dict[str, list[str]] = {
     _EVENT_INVESTIGATION: [
@@ -134,7 +144,7 @@ CIAA Special Court corruption case as the case described below.
 You must respond with ONLY a JSON object in one of these two formats:
 
 If the article IS about the same case:
-{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case.", "summary": "A concise 1-3 sentence summary of what the news article reports (who is involved, what happened, key facts, timeline). Write this as a public-facing article description, not as a matching rationale.", "event_type": "investigation|filing|hearing|verdict|appeal"}
+{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case.", "summary": "संक्षिप्त सारांश (१-२ वाक्यमा नेपालीमा लेख्नुहोस्): यस समाचारले के भनेको छ — को संलग्न छ, के भयो, मुख्य तथ्यहरू। यो सार्वजनिक रूपमा देखाइने विवरण हो।", "event_type": "investigation|filing|hearing|verdict|appeal|other"}
 
 If the article is NOT about the same case:
 {"relevant": false, "reason": "Brief explanation in English of why this article does not match.", "summary": "A concise 1-3 sentence summary of what the news article reports."}
@@ -145,6 +155,7 @@ Event types for the "event_type" field:
 - "hearing" — court hearing, proceedings, or bench session coverage
 - "verdict" — Special Court verdict, decision, or conviction
 - "appeal" — Supreme Court appeal or review
+- "other" — relevant article that does not clearly fit the above categories
 
 Rules:
 - The article must reference the same corruption case, not just mention the same person in an unrelated context.
@@ -152,8 +163,8 @@ Rules:
 - Matching on defendant name + corruption allegations is medium evidence.
 - If the article is about a different corruption case involving the same person, it is NOT relevant.
 - If the article is about the same person but not about corruption allegations, it is NOT relevant.
-- The "summary" field should describe the article content itself, not how the LLM matched it to the case.
-- The "event_type" field should identify which stage of the case lifecycle the article covers. Use your best judgment based on article content. If unclear, default to "filing".
+- The "summary" field should describe the article content itself in Nepali, not how the LLM matched it to the case.
+- The "event_type" field is required when relevant=true. Never return an empty string. Use "other" if the article is relevant but does not clearly fit the above categories.
 """
 
 
@@ -1398,6 +1409,9 @@ class NewsEnricher:
             summary = ""
             event_type = ""
 
+        if event_type is None or str(event_type).strip().lower() in {"", "none", "unknown"}:
+            event_type = "other"
+
         if not is_relevant:
             stats["rejected"] += 1
             if self.verbose:
@@ -2023,10 +2037,47 @@ Excerpt: {article_excerpt}"""
                     )
                     existing_source_ids.add(source.source_id)
 
-            case.evidence = evidence
+            case.evidence = self._sort_media_news_evidence(evidence)
             case.save(update_fields=["evidence", "updated_at"])
 
         return new_count
+
+    def _sort_media_news_evidence(self, evidence: list[dict]) -> list[dict]:
+        """Keep non-news evidence first, then sort MEDIA_NEWS by lifecycle event_type."""
+        source_ids = self._extract_source_ids_from_evidence(evidence)
+        if not source_ids:
+            return evidence
+
+        try:
+            media_news_source_ids = set(
+                DocumentSource.objects.filter(
+                    source_id__in=source_ids,
+                    source_type=SourceType.MEDIA_NEWS,
+                ).values_list("source_id", flat=True)
+            )
+        except Exception:
+            logger.exception("Failed to sort MEDIA_NEWS evidence entries")
+            close_old_connections()
+            return evidence
+
+        non_media_news = []
+        media_news = []
+        for index, entry in enumerate(evidence):
+            if (
+                isinstance(entry, dict)
+                and entry.get("source_id") in media_news_source_ids
+            ):
+                media_news.append((index, entry))
+            else:
+                non_media_news.append(entry)
+
+        media_news.sort(
+            key=lambda indexed: (
+                _EVENT_LIFECYCLE_ORDER.get(indexed[1].get("event_type"), _EVENT_LIFECYCLE_ORDER[_EVENT_OTHER]),
+                indexed[0],
+            )
+        )
+        return non_media_news + [entry for _, entry in media_news]
 
     def _create_document_source(
         self, article: dict, fallback_date: Optional[date] = None
@@ -2063,8 +2114,8 @@ Excerpt: {article_excerpt}"""
         outlet = _guess_outlet(article.get("url", ""))
         pub_date = article.get("publication_date")
         if pub_date:
-            return f"News article from {outlet} ({pub_date.isoformat()})."
-        return f"News article from {outlet}."
+            return f"{outlet}ले यस मुद्दासम्बन्धी समाचार प्रकाशित गरेको ({pub_date.isoformat()})।"
+        return f"{outlet}ले यस मुद्दासम्बन्धी समाचार प्रकाशित गरेको।"
 
     def _build_evidence_entry(self, source_id: str, article: dict) -> dict:
         """Build case evidence entry for a MEDIA_NEWS source."""
