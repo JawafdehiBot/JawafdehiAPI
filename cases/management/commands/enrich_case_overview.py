@@ -542,8 +542,9 @@ def _read_sse_json(response) -> dict:
     The LLM proxy may return one of three shapes:
 
     1. **Plain JSON** ``{"choices":[{...}],...}`` — return immediately.
-    2. **SSE pseudo-stream** — one ``data:`` line containing a complete
-       non-streaming object with ``choices[0].message.content``.  Return it.
+    2. **SSE pseudo-stream** — multiple ``data:`` lines each containing a
+       complete object with ``choices[0].message.content``. Accumulate content
+       from all objects until ``[DONE]``, then return the merged result.
     3. **True SSE stream** — lines of ``data: {...}`` chunks with
        ``object: "chat.completion.chunk"`` and ``choices[0].delta.content``.
        Accumulate all delta content pieces until ``[DONE]``, then build a
@@ -554,7 +555,8 @@ def _read_sse_json(response) -> dict:
     line_count = 0
     accumulated_content = ""
     streaming_seen = False
-    streaming_info = {}  # carries over id/model/created from last chunk
+    streaming_info = {}
+    last_complete_obj = None
 
     for raw_line in response:
         line_count += 1
@@ -572,7 +574,6 @@ def _read_sse_json(response) -> dict:
                 idx += 1
                 continue
             if isinstance(obj, dict):
-                # Detect streaming chunks
                 if obj.get("object") == "chat.completion.chunk":
                     streaming_seen = True
                     streaming_info["id"] = obj.get("id", streaming_info.get("id"))
@@ -593,9 +594,6 @@ def _read_sse_json(response) -> dict:
 
                 if "choices" in obj or "content" in obj:
                     if streaming_seen:
-                        # We've seen streaming chunks before this non-chunk
-                        # object — this is likely a terminal object.
-                        # Accumulate any final content, then stop.
                         choices = obj.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
@@ -603,17 +601,30 @@ def _read_sse_json(response) -> dict:
                             if piece:
                                 accumulated_content += piece
                         break
-                    logger.debug(
-                        "SSE matched object keys=%s sample=%s",
-                        list(obj.keys()),
-                        str(obj)[:300],
+
+                    # Pseudo-stream: full objects, may be multiple — accumulate
+                    # content and keep going until [DONE] or end-of-stream.
+                    last_complete_obj = obj
+                    streaming_info["id"] = obj.get("id", streaming_info.get("id"))
+                    streaming_info["created"] = obj.get(
+                        "created", streaming_info.get("created")
                     )
-                    return obj
+                    streaming_info["model"] = obj.get(
+                        "model", streaming_info.get("model")
+                    )
+                    choices = obj.get("choices", [])
+                    if choices:
+                        msg = choices[0].get("message", {})
+                        piece = msg.get("content", "") if msg else ""
+                        if piece:
+                            accumulated_content += piece
+                    idx = end
+                    continue
             idx = end
 
-    # Build result from accumulated streaming content
-    if streaming_seen:
-        synthetic = {
+    # Return accumulated result
+    if last_complete_obj is not None or streaming_seen:
+        merged = {
             "id": streaming_info.get("id", ""),
             "object": "chat.completion",
             "created": streaming_info.get("created", 0),
@@ -627,11 +638,12 @@ def _read_sse_json(response) -> dict:
             ],
         }
         logger.debug(
-            "SSE streaming accumulated: content_len=%d", len(accumulated_content)
+            "SSE accumulated: content_len=%d pseudo=%s",
+            len(accumulated_content),
+            last_complete_obj is not None,
         )
-        return synthetic
+        return merged
 
-    # Fallback — try accumulated buffer as plain JSON
     logger.warning(
         "SSE fallback: no choices/content object after %d lines, buf_len=%d",
         line_count,
