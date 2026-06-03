@@ -1585,7 +1585,7 @@ class Command(BaseCommand):
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "stream": False,
+            "stream": True,
         }
         data = json.dumps(body).encode("utf-8")
         logger.debug(
