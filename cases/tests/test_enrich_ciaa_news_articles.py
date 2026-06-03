@@ -28,6 +28,13 @@ from cases.models import (
 )
 from cases.services.news_enricher import (
     NewsEnricher,
+    _detect_case_events,
+    _EVENT_APPEAL,
+    _EVENT_FILING,
+    _EVENT_HEARING,
+    _EVENT_INVESTIGATION,
+    _EVENT_QUERY_TEMPLATES,
+    _EVENT_VERDICT,
     _extract_org_name_from_title,
     _extract_text_from_html,
     _extract_title_from_html,
@@ -236,6 +243,45 @@ class TestNewsEnricherService:
         from cases.services.news_enricher import _MAX_ARTICLES_PER_EVENT_TYPE
 
         assert _MAX_ARTICLES_PER_EVENT_TYPE == 2
+
+    def test_detect_case_events_always_returns_filing_investigation(self):
+        case = self._create_case(
+            case_start_date=None,
+            case_end_date=None,
+            court_cases=[],
+        )
+        events = _detect_case_events(case)
+        assert _EVENT_FILING in events
+        assert _EVENT_INVESTIGATION in events
+
+    def test_detect_case_events_with_start_date_adds_hearing(self):
+        case = self._create_case(
+            case_start_date=date(2023, 7, 1),
+            case_end_date=None,
+            court_cases=[],
+        )
+        events = _detect_case_events(case)
+        assert _EVENT_HEARING in events
+        assert _EVENT_VERDICT not in events
+        assert _EVENT_APPEAL not in events
+
+    def test_detect_case_events_with_end_date_adds_verdict_appeal(self):
+        case = self._create_case(
+            case_start_date=date(2023, 7, 1),
+            case_end_date=date(2024, 6, 12),
+            court_cases=[],  # no supreme: entry — should still get appeal
+        )
+        events = _detect_case_events(case)
+        assert _EVENT_VERDICT in events
+        assert _EVENT_APPEAL in events
+
+    def test_appeal_query_templates_include_ciaa_specific(self):
+        templates = _EVENT_QUERY_TEMPLATES.get(_EVENT_APPEAL, [])
+        formatted = set()
+        for t in templates:
+            formatted.add(t.format(name="गोपाल"))
+        assert "गोपाल अख्तियार पुनरावेदन" in formatted
+        assert "गोपाल सर्वोच्च अदालत फैसला" in formatted
 
     def test_extract_text_from_html(self):
         html = self._get_sample_html(body="This is article content. " * 20)

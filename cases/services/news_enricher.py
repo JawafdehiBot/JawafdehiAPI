@@ -115,6 +115,8 @@ _EVENT_QUERY_TEMPLATES: dict[str, list[str]] = {
     _EVENT_APPEAL: [
         "{name} पुनरावेदन सर्वोच्च",
         "{name} supreme court appeal corruption",
+        "{name} अख्तियार पुनरावेदन",
+        "{name} सर्वोच्च अदालत फैसला",
     ],
 }
 
@@ -392,55 +394,27 @@ def _append_event_targeted_queries(queries: list[str], case: Case) -> None:
 
 
 def _detect_case_events(case: Case) -> list[str]:
-    """Detect which lifecycle events exist for this case.
+    """Detect lifecycle event types for event-targeted search queries.
 
-    Uses NGM hearing data when available to detect hearings, verdicts.
-    Falls back to court_cases field analysis for special/supreme detection
-    and case_start_date / case_end_date for investigation/filing signals.
+    Uses an opportunistic approach: generate queries for all plausible
+    events and rely on LLM filtering to reject irrelevant results.
+    Every CIAA case has a filing and investigation — those are always
+    emitted. Hearing/verdict/appeal are emitted when case dates exist
+    (198-200/200 cases), regardless of whether court_cases has the
+    corresponding court entry.
 
-    NGM failures are silent — returns [] on any error, which means
-    the enricher uses only general queries (current behavior).
+    NGM integration remains as an optional enhancement — when NGM data
+    is available, hearing/verdict queries can optionally be time-scoped,
+    but the base event detection does not depend on NGM.
     """
-    events = []
-
-    has_special = False
-    has_supreme = False
-    if case.court_cases:
-        for cc in case.court_cases:
-            if isinstance(cc, str) and ":" in cc:
-                court_id, _ = cc.split(":", 1)
-                if court_id.lower() == "special":
-                    has_special = True
-                elif court_id.lower() == "supreme":
-                    has_supreme = True
-
-    if has_special:
-        events.append(_EVENT_FILING)
-
-    hearing_data = _fetch_ngm_hearing_data(case)
-    if hearing_data is not None:
-        verdict_found = False
-        hearing_found = False
-        for h in hearing_data.get("hearings", []):
-            decision = (h.get("decision_type") or "").lower()
-            status = (h.get("case_status") or "").lower()
-            if any(kw in decision for kw in ("फैसला", "verdict", "judgment", "decision")):
-                verdict_found = True
-            if any(kw in status for kw in ("सुनुवाइ", "hearing", "पेशी")):
-                hearing_found = True
-        if verdict_found:
-            events.append(_EVENT_VERDICT)
-        if hearing_found or hearing_data.get("hearings"):
-            events.append(_EVENT_HEARING)
-    else:
-        if has_special:
-            events.append(_EVENT_HEARING)
-
-    if has_supreme:
-        events.append(_EVENT_APPEAL)
+    events = [_EVENT_FILING, _EVENT_INVESTIGATION]
 
     if case.case_start_date:
-        events.append(_EVENT_INVESTIGATION)
+        events.append(_EVENT_HEARING)
+
+    if case.case_end_date:
+        events.append(_EVENT_VERDICT)
+        events.append(_EVENT_APPEAL)
 
     return events
 
