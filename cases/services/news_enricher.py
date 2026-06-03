@@ -842,7 +842,7 @@ class NewsEnricher:
         llm_base_url: Optional[str] = None,
         llm_api_key: Optional[str] = None,
         max_articles_per_case: int = 5,
-        search_delay: float = 1.0,
+        search_delay: float = 2.0,
         fetch_delay: float = 0.5,
         verbose: bool = False,
     ):
@@ -1020,44 +1020,35 @@ class NewsEnricher:
         return accepted, stats
 
     def _search_candidates(self, queries: list[str], stats: dict) -> list[dict]:
-        """Execute search queries in parallel and collect deduplicated results."""
+        """Execute search queries sequentially and collect deduplicated results."""
         all_candidates = []
         seen_urls = set()
 
-        def _search_one(query: str) -> list[dict]:
+        for index, query in enumerate(queries):
+            stats["searched"] += 1
             try:
                 results = _search_duckduckgo(query)
-                time.sleep(self.search_delay)
-                return results
             except Exception as exc:
                 logger.warning("  Search error for '%s': %s", query[:60], exc)
                 stats["errors"] += 1
-                return []
+                results = []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_query = {executor.submit(_search_one, q): q for q in queries}
-            for future in concurrent.futures.as_completed(future_to_query):
-                query = future_to_query[future]
-                stats["searched"] += 1
-                try:
-                    results = future.result()
-                except Exception as exc:
-                    logger.warning("  Search error for '%s': %s", query[:60], exc)
-                    stats["errors"] += 1
-                    continue
-                new_count = 0
-                for r in results:
-                    url = r["url"]
-                    if url not in seen_urls:
-                        seen_urls.add(url)
-                        all_candidates.append(r)
-                        new_count += 1
-                logger.info(
-                    "  query '%s' → %d results (%d new)",
-                    query[:70],
-                    len(results),
-                    new_count,
-                )
+            new_count = 0
+            for r in results:
+                url = r["url"]
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    all_candidates.append(r)
+                    new_count += 1
+            logger.info(
+                "  query '%s' → %d results (%d new)",
+                query[:70],
+                len(results),
+                new_count,
+            )
+
+            if index < len(queries) - 1 and self.search_delay > 0:
+                time.sleep(self.search_delay)
 
         logger.info(
             "  Found %d candidate URLs from %d queries",

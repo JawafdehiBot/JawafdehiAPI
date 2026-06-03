@@ -258,6 +258,28 @@ class TestNewsEnricherService:
 
         assert _MAX_ARTICLES_PER_EVENT_TYPE == 2
 
+    def test_search_candidates_runs_queries_sequentially_with_delay(self):
+        enricher = self._create_enricher()
+        enricher.search_delay = 2.0
+        stats = {"searched": 0, "errors": 0}
+        queries = ["q1", "q2", "q3"]
+
+        with patch(
+            "cases.services.news_enricher._search_duckduckgo",
+            side_effect=[
+                [{"url": "https://example.com/1", "title": "one", "snippet": ""}],
+                [{"url": "https://example.com/2", "title": "two", "snippet": ""}],
+                [{"url": "https://example.com/1", "title": "dup", "snippet": ""}],
+            ],
+        ) as search_mock, patch("cases.services.news_enricher.time.sleep") as sleep_mock:
+            results = enricher._search_candidates(queries, stats)
+
+        assert search_mock.call_count == 3
+        assert sleep_mock.call_count == 2
+        sleep_mock.assert_any_call(2.0)
+        assert stats["searched"] == 3
+        assert len(results) == 2
+
     def test_detect_case_events_always_returns_filing_investigation(self):
         case = self._create_case(
             case_start_date=None,

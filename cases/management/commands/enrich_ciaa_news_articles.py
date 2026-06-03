@@ -98,8 +98,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--search-delay",
             type=float,
-            default=1.0,
-            help="Delay in seconds between search queries (default: 1.0)",
+            default=2.0,
+            help="Delay in seconds between search queries (default: 2.0)",
         )
         parser.add_argument(
             "--fetch-delay",
@@ -114,7 +114,7 @@ class Command(BaseCommand):
             val = options.get(name)
             if val is not None and val < 0:
                 return f"--{name} must be a non-negative integer"
-        search_delay = options.get("search_delay", 1.0)
+        search_delay = options.get("search_delay", 2.0)
         fetch_delay = options.get("fetch_delay", 0.5)
         if search_delay < 0 or fetch_delay < 0:
             return "--search-delay and --fetch-delay must be non-negative"
@@ -250,7 +250,7 @@ class Command(BaseCommand):
             llm_base_url=base_url,
             llm_api_key=api_key,
             max_articles_per_case=max_articles,
-            search_delay=options.get("search_delay", 1.0),
+            search_delay=options.get("search_delay", 2.0),
             fetch_delay=options.get("fetch_delay", 0.5),
             verbose=verbose,
         )
