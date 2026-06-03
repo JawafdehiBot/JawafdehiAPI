@@ -1185,6 +1185,10 @@ class NewsEnricher:
         )
         return []
 
+    # Candidates are fetched and verified in batches so we can stop early
+    # once all event types are covered, avoiding unnecessary network + LLM work.
+    _CANDIDATE_BATCH_SIZE = 12
+
     def _fetch_and_verify_candidates(
         self,
         candidates: list[dict],
@@ -1194,24 +1198,15 @@ class NewsEnricher:
         press_release_text: Optional[str] = None,
         max_to_accept: Optional[int] = None,
     ) -> list[dict]:
-        """Fetch candidate articles in parallel, then verify with LLM in parallel."""
-        fetched = [
-            r
-            for r in self._fetch_candidates_parallel(candidates, stats)
-            if r is not None
-        ]
-
-        if not fetched:
-            return []
-
+        """Fetch and verify candidates in batches. Stops early when all event types covered."""
         limit = (
             max_to_accept if max_to_accept is not None else self.max_articles_per_case
         )
 
-        accepted = []
+        accepted: list[dict] = []
         accepted_event_types: set[str] = set()
         event_type_counts = self._get_existing_event_type_counts(case)
-        deferred: list[dict] = []
+        all_deferred: list[dict] = []
 
         def _would_exceed_event_cap(event: str) -> bool:
             return (
@@ -1219,24 +1214,76 @@ class NewsEnricher:
                 and event_type_counts.get(event, 0) >= _MAX_ARTICLES_PER_EVENT_TYPE
             )
 
+        def _uncovered_events() -> list[str]:
+            return [
+                et for et in _ALL_EVENT_TYPES
+                if et not in accepted_event_types and not _would_exceed_event_cap(et)
+            ]
+
+        for batch_start in range(0, len(candidates), self._CANDIDATE_BATCH_SIZE):
+            if len(accepted) >= limit:
+                break
+            if not _uncovered_events():
+                break
+
+            batch = candidates[batch_start:batch_start + self._CANDIDATE_BATCH_SIZE]
+            fetched = [
+                r for r in self._fetch_candidates_parallel(batch, stats)
+                if r is not None
+            ]
+
+            if not fetched:
+                continue
+
+            batch_def = self._verify_candidates_parallel(
+                fetched, case, api_key, stats, press_release_text,
+                accepted, accepted_event_types, event_type_counts,
+                _would_exceed_event_cap,
+            )
+            all_deferred.extend(batch_def)
+
+            batch_num = batch_start // self._CANDIDATE_BATCH_SIZE + 1
+            total_batches = (
+                len(candidates) + self._CANDIDATE_BATCH_SIZE - 1
+            ) // self._CANDIDATE_BATCH_SIZE
+            logger.info(
+                "  Batch %d/%d: %d accepted (%d event types), %d deferred",
+                batch_num, total_batches,
+                len(accepted), len(accepted_event_types), len(batch_def),
+            )
+
+        self._fill_deferred_slots(
+            all_deferred, limit, accepted, accepted_event_types,
+            event_type_counts, stats, _would_exceed_event_cap,
+        )
+
+        return accepted
+
+    def _verify_candidates_parallel(
+        self,
+        fetched: list[dict],
+        case: Case,
+        api_key: Optional[str],
+        stats: dict,
+        press_release_text: Optional[str],
+        accepted: list[dict],
+        accepted_event_types: set[str],
+        event_type_counts: dict[str, int],
+        _would_exceed_event_cap,
+    ) -> list[dict]:
+        """Verify fetched candidates with LLM in parallel. Returns deferred list."""
+        deferred: list[dict] = []
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             future_to_result = {}
             for result in fetched:
                 future = executor.submit(
                     self._verify_candidate,
-                    result,
-                    case,
-                    api_key,
-                    stats,
-                    press_release_text,
+                    result, case, api_key, stats, press_release_text,
                 )
                 future_to_result[future] = result
 
             for future in concurrent.futures.as_completed(future_to_result):
-                if len(accepted) >= limit:
-                    for f in future_to_result:
-                        f.cancel()
-                    break
                 try:
                     verified = future.result()
                 except Exception as exc:
@@ -1256,21 +1303,30 @@ class NewsEnricher:
                         stats["accepted"] += 1
                         logger.info(
                             "  Accepted: %s (event: %s, confidence: %s)",
-                            verified["url"][:80],
-                            event,
-                            verified["confidence"],
+                            verified["url"][:80], event, verified["confidence"],
                         )
                     else:
                         deferred.append(verified)
                         logger.debug(
                             "  Deferred (duplicate event %s): %s",
-                            event or "unknown",
-                            verified["url"][:80],
+                            event or "unknown", verified["url"][:80],
                         )
 
-        # Fill remaining slots from deferred, preferring unique events, capped at
-        # _MAX_ARTICLES_PER_EVENT_TYPE per event type.
+        return deferred
+
+    def _fill_deferred_slots(
+        self,
+        deferred: list[dict],
+        limit: int,
+        accepted: list[dict],
+        accepted_event_types: set[str],
+        event_type_counts: dict[str, int],
+        stats: dict,
+        _would_exceed_event_cap,
+    ) -> None:
+        """Fill remaining accepted slots from deferred candidates."""
         remaining = limit - len(accepted)
+
         for verified in deferred:
             if remaining <= 0:
                 break
@@ -1287,15 +1343,9 @@ class NewsEnricher:
                 remaining -= 1
                 logger.info(
                     "  Accepted (deferred): %s (event: %s, confidence: %s)",
-                    verified["url"][:80],
-                    event,
-                    verified["confidence"],
+                    verified["url"][:80], event, verified["confidence"],
                 )
 
-        # Fill remaining slots from deferred, allowing same event type but
-        # capped at _MAX_ARTICLES_PER_EVENT_TYPE. Duplicate event types beyond
-        # the cap are left unfilled — future re-runs will fill them when
-        # hearing/verdict coverage exists.
         for verified in deferred:
             if remaining <= 0:
                 break
@@ -1308,12 +1358,8 @@ class NewsEnricher:
             remaining -= 1
             logger.info(
                 "  Accepted (same event): %s (event: %s, confidence: %s)",
-                verified["url"][:80],
-                event,
-                verified["confidence"],
+                verified["url"][:80], event, verified["confidence"],
             )
-
-        return accepted
 
     def _fetch_candidates_parallel(
         self,
