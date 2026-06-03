@@ -16,7 +16,13 @@ from urllib.parse import quote_plus, urlparse
 import requests
 from django.db import close_old_connections, transaction
 
-from cases.models import Case, CaseEntityRelationship, DocumentSource, RelationshipType, SourceType
+from cases.models import (
+    Case,
+    CaseEntityRelationship,
+    DocumentSource,
+    RelationshipType,
+    SourceType,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1372,13 +1378,15 @@ class NewsEnricher:
         article_title = fetch_result["article_title"]
 
         if api_key and self.llm_base_url:
-            is_relevant, confidence, reason, summary, event_type = self._verify_article_relevance(
-                case=case,
-                article_title=article_title,
-                article_url=url,
-                article_excerpt=article_text[:1500],
-                api_key=api_key,
-                press_release_text=press_release_text,
+            is_relevant, confidence, reason, summary, event_type = (
+                self._verify_article_relevance(
+                    case=case,
+                    article_title=article_title,
+                    article_url=url,
+                    article_excerpt=article_text[:1500],
+                    api_key=api_key,
+                    press_release_text=press_release_text,
+                )
             )
         else:
             is_relevant = False
@@ -1553,7 +1561,10 @@ class NewsEnricher:
         return new_sources
 
     def _log_case_article_summary(
-        self, case: Case, pre_existing: int, new_sources: int,
+        self,
+        case: Case,
+        pre_existing: int,
+        new_sources: int,
         accepted: Optional[list[dict]] = None,
     ) -> None:
         """Log the final news article state for a case after enrichment."""
@@ -1605,9 +1616,7 @@ class NewsEnricher:
                 for et in _ALL_EVENT_TYPES:
                     if et in event_counts:
                         parts.append(f"{et}={event_counts[et]}")
-                logger.info(
-                    "  Event coverage (accepted in run): %s", ", ".join(parts)
-                )
+                logger.info("  Event coverage (accepted in run): %s", ", ".join(parts))
 
     def _verify_article_relevance(
         self,
