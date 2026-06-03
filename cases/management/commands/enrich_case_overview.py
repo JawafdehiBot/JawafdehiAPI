@@ -536,123 +536,25 @@ def _extract_json_body(raw: str) -> str:
     return raw
 
 
-def _read_sse_json(response) -> dict:
-    """Read the final non-streaming (or accumulated streaming) completion dict.
+def _parse_llm_opencode_response(payload: dict) -> str:
+    """Extract response text from a non-streaming completion payload."""
+    return payload.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-    The LLM proxy may return one of three shapes:
 
-    1. **Plain JSON** ``{"choices":[{...}],...}`` — return immediately.
-    2. **SSE pseudo-stream** — multiple ``data:`` lines each containing a
-       complete object with ``choices[0].message.content``. Accumulate content
-       from all objects until ``[DONE]``, then return the merged result.
-    3. **True SSE stream** — lines of ``data: {...}`` chunks with
-       ``object: "chat.completion.chunk"`` and ``choices[0].delta.content``.
-       Accumulate all delta content pieces until ``[DONE]``, then build a
-       synthetic non-streaming dict so the caller sees ``message.content``.
-    """
+def _parse_llm_response_json(raw_text: str) -> dict:
+    """Decode LLM response text into a dict, handling surrounding markdown."""
     decoder = json.JSONDecoder()
-    buf = ""
-    line_count = 0
-    accumulated_content = ""
-    streaming_seen = False
-    streaming_info = {}
-    last_complete_obj = None
-
-    for raw_line in response:
-        line_count += 1
-        line = raw_line.decode("utf-8", errors="replace")
-        buf += line
-        stripped = line.strip()
-        logger.debug("SSE line %d: %s", line_count, stripped[:200])
-        if not stripped or stripped == "data: [DONE]":
-            continue
-        idx = 0
-        while idx < len(stripped):
-            try:
-                obj, end = decoder.raw_decode(stripped, idx)
-            except json.JSONDecodeError:
-                idx += 1
-                continue
-            if isinstance(obj, dict):
-                if obj.get("object") == "chat.completion.chunk":
-                    streaming_seen = True
-                    streaming_info["id"] = obj.get("id", streaming_info.get("id"))
-                    streaming_info["created"] = obj.get(
-                        "created", streaming_info.get("created")
-                    )
-                    streaming_info["model"] = obj.get(
-                        "model", streaming_info.get("model")
-                    )
-                    choices = obj.get("choices", [])
-                    if choices:
-                        delta = choices[0].get("delta", {})
-                        piece = delta.get("content", "")
-                        if piece:
-                            accumulated_content += piece
-                    idx = end
-                    continue
-
-                if "choices" in obj or "content" in obj:
-                    if streaming_seen:
-                        choices = obj.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {})
-                            piece = delta.get("content", "")
-                            if piece:
-                                accumulated_content += piece
-                        break
-
-                    # Pseudo-stream: full objects, may be multiple — accumulate
-                    # content and keep going until [DONE] or end-of-stream.
-                    last_complete_obj = obj
-                    streaming_info["id"] = obj.get("id", streaming_info.get("id"))
-                    streaming_info["created"] = obj.get(
-                        "created", streaming_info.get("created")
-                    )
-                    streaming_info["model"] = obj.get(
-                        "model", streaming_info.get("model")
-                    )
-                    choices = obj.get("choices", [])
-                    if choices:
-                        msg = choices[0].get("message", {})
-                        piece = msg.get("content", "") if msg else ""
-                        if piece:
-                            accumulated_content += piece
-                    idx = end
-                    continue
-            idx = end
-
-    # Return accumulated result
-    if last_complete_obj is not None or streaming_seen:
-        merged = {
-            "id": streaming_info.get("id", ""),
-            "object": "chat.completion",
-            "created": streaming_info.get("created", 0),
-            "model": streaming_info.get("model", ""),
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": accumulated_content},
-                    "finish_reason": "stop",
-                }
-            ],
-        }
-        logger.debug(
-            "SSE accumulated: content_len=%d pseudo=%s",
-            len(accumulated_content),
-            last_complete_obj is not None,
-        )
-        return merged
-
-    logger.warning(
-        "SSE fallback: no choices/content object after %d lines, buf_len=%d",
-        line_count,
-        len(buf),
-    )
-    try:
-        return json.loads(buf)
-    except json.JSONDecodeError:
-        return decoder.raw_decode(buf)[0]
+    idx = 0
+    while idx < len(raw_text):
+        try:
+            obj, end = decoder.raw_decode(raw_text, idx)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict) and ("choices" in obj or "content" in obj):
+            return obj
+        idx = end
+    # Fallback: try decoding from start
+    return decoder.raw_decode(raw_text)[0]
 
 
 class Command(BaseCommand):
@@ -1597,7 +1499,6 @@ class Command(BaseCommand):
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.1,
-            "stream": True,
         }
         data = json.dumps(body).encode("utf-8")
         logger.debug(
@@ -1612,82 +1513,35 @@ class Command(BaseCommand):
                     endpoint, data=data, headers=headers, method="POST"
                 )
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    payload = _read_sse_json(resp)
-                logger.debug(
-                    "LLM opencode payload: keys=%s type(choices)=%s raw_sample=%s",
-                    list(payload.keys()),
-                    type(payload.get("choices")).__name__,
-                    str(payload)[:500],
-                )
-                response_model = payload.get("model") or "(unknown)"
-                logger.info(
-                    "LLM opencode: requested_model=%s response_model=%s",
-                    normalized_model,
-                    response_model,
-                )
-                if response_model != "(unknown)":
-                    resp_normalized = normalize_model(response_model)
-                    if resp_normalized != normalized_model:
-                        logger.warning(
-                            "LLM opencode: model mismatch — "
-                            "sent %r, response %r (normalized: %r vs %r)",
-                            model,
-                            response_model,
-                            normalized_model,
-                            resp_normalized,
-                        )
-                choices = payload.get("choices", [])
-                if not choices:
-                    logger.warning(
-                        "LLM opencode: attempt %d — empty choices list", attempt
-                    )
-                    self.stdout.write(
-                        self.style.WARNING("  LLM returned empty choices list")
-                    )
-                    continue
-                choice = choices[0]
-                logger.debug(
-                    "LLM opencode choice[0] keys=%s type=%s finish_reason=%s",
-                    list(choice.keys()),
-                    choice.get("type", "N/A"),
-                    choice.get("finish_reason", "N/A"),
-                )
-                if "message" in choice:
-                    raw = choice["message"].get("content", "")
-                    logger.debug(
-                        "LLM opencode message content length=%d sample=%s",
-                        len(raw),
-                        raw[:100],
-                    )
-                elif "delta" in choice:
-                    raw = choice["delta"].get("content", "")
-                    logger.warning(
-                        "LLM opencode: choice[0] has delta (streaming) — extracted content=%s",
-                        raw[:100] if raw else "(empty)",
-                    )
-                else:
-                    raw = choice.get("text", "")
-                    logger.warning(
-                        "LLM opencode: choice[0] has neither message nor delta — using raw=%s",
-                        raw[:100] if raw else "(empty)",
-                    )
+                    raw_text = resp.read().decode("utf-8")
+                payload = _parse_llm_response_json(raw_text)
+                raw = _parse_llm_opencode_response(payload)
                 response_model = payload.get("model", "")
                 logger.info(
-                    "LLM opencode: attempt %d succeeded — response_len=%d model=%s request_model=%s",
+                    "LLM opencode: attempt %d succeeded — "
+                    "response_len=%d model=%s request_model=%s",
                     attempt,
                     len(raw),
                     response_model,
                     normalized_model,
                 )
-                resp_normalized = normalize_model(response_model or "")
-                if resp_normalized != normalized_model:
+                if not raw.strip():
                     logger.warning(
-                        "LLM opencode: model mismatch — "
-                        "sent %r, response %r (normalized: %r vs %r)",
-                        model,
-                        response_model,
-                        normalized_model,
-                        resp_normalized,
+                        "LLM opencode: attempt %d — empty response content", attempt
+                    )
+                    if attempt < MAX_LLM_RETRIES:
+                        wait = 2**attempt
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"  LLM returned empty response on attempt {attempt},"
+                                f" retrying in {wait}s..."
+                            )
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise CommandError(
+                        "LLM returned empty response after "
+                        f"{MAX_LLM_RETRIES} attempts"
                     )
                 return _extract_json_body(raw)
             except urllib.error.HTTPError as exc:
