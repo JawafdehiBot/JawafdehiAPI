@@ -221,6 +221,32 @@ class TestNewsEnricherService:
         queries = _generate_query_variations(case)
         assert len(queries) <= 15
 
+    def test_generate_query_variations_include_english_romanized_queries(self):
+        case = self._create_case()
+        entity = JawafEntity.objects.create(display_name="राजु पुरी")
+        CaseEntityRelationship.objects.create(
+            case=case, entity=entity, relationship_type=RelationshipType.ACCUSED
+        )
+
+        queries = _generate_query_variations(case)
+        english_queries = [q for q in queries if "राजु" not in q and "पुरी" not in q]
+
+        assert len(english_queries) >= 4
+        assert any("raju puri CIAA case Nepal" in q for q in queries)
+        assert any("raju puri corruption case Nepal" in q for q in queries)
+
+    def test_generate_query_variations_adds_nepal_keyword_to_all_queries(self):
+        case = self._create_case(
+            court_cases=["special:080-CR-0007"],
+            case_start_date=date(2023, 7, 1),
+            case_end_date=date(2024, 6, 12),
+            key_allegations=["घुस रिश्वत भ्रष्टाचार अनियमितता अकुत सम्पत्ति"],
+        )
+        queries = _generate_query_variations(case)
+
+        assert queries
+        assert all("Nepal" in q or "नेपाल" in q for q in queries)
+
     def test_extract_org_name_from_title(self):
         title = "नेपाल सरकार विरुद्ध साझा भण्डार सहकारी संस्था लिमिटेड मुद्दा"
         org = _extract_org_name_from_title(title)

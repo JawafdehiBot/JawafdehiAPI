@@ -330,21 +330,19 @@ def _generate_query_variations(case: Case) -> list[str]:
     """
     case_number = _resolve_case_number(case)
     title = case.title or ""
+    accused_names = _get_accused_names(case)
 
     event_queries: list[str] = []
     _append_event_targeted_queries(event_queries, case)
 
     general_queries = _build_name_based_queries(case)
+    _append_english_name_queries(general_queries, accused_names)
     _append_title_keyword_query(general_queries, title)
     _append_accused_corruption_queries(general_queries, case)
     _append_location_queries(general_queries, case, title)
 
-    deduped_events = _deduplicate_queries(
-        event_queries, case_number, _get_accused_names(case)
-    )
-    deduped_general = _deduplicate_queries(
-        general_queries, case_number, _get_accused_names(case)
-    )
+    deduped_events = _deduplicate_queries(event_queries, case_number, accused_names)
+    deduped_general = _deduplicate_queries(general_queries, case_number, accused_names)
 
     reserved_event_slots = min(4, len(deduped_events))
     combined = (
@@ -352,7 +350,120 @@ def _generate_query_variations(case: Case) -> list[str]:
         + deduped_general[: 15 - reserved_event_slots]
         + deduped_events[reserved_event_slots:]
     )
-    return _deduplicate_queries(combined, case_number, _get_accused_names(case))[:15]
+    return _normalize_search_queries(
+        _deduplicate_queries(combined, case_number, accused_names)
+    )[:15]
+
+
+_DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
+
+
+_ROMANIZATION_REPLACEMENTS = (
+    ("क्ष", "ksh"),
+    ("त्र", "tr"),
+    ("ज्ञ", "gy"),
+    ("श्र", "shr"),
+    ("अ", "a"),
+    ("आ", "aa"),
+    ("इ", "i"),
+    ("ई", "ee"),
+    ("उ", "u"),
+    ("ऊ", "oo"),
+    ("ए", "e"),
+    ("ऐ", "ai"),
+    ("ओ", "o"),
+    ("औ", "au"),
+    ("क", "k"),
+    ("ख", "kh"),
+    ("ग", "g"),
+    ("घ", "gh"),
+    ("ङ", "n"),
+    ("च", "ch"),
+    ("छ", "chh"),
+    ("ज", "j"),
+    ("झ", "jh"),
+    ("ञ", "n"),
+    ("ट", "t"),
+    ("ठ", "th"),
+    ("ड", "d"),
+    ("ढ", "dh"),
+    ("ण", "n"),
+    ("त", "t"),
+    ("थ", "th"),
+    ("द", "d"),
+    ("ध", "dh"),
+    ("न", "n"),
+    ("प", "p"),
+    ("फ", "ph"),
+    ("ब", "b"),
+    ("भ", "bh"),
+    ("म", "m"),
+    ("य", "y"),
+    ("र", "r"),
+    ("ल", "l"),
+    ("व", "w"),
+    ("श", "sh"),
+    ("ष", "sh"),
+    ("स", "s"),
+    ("ह", "h"),
+    ("ा", "a"),
+    ("ि", "i"),
+    ("ी", "i"),
+    ("ु", "u"),
+    ("ू", "u"),
+    ("े", "e"),
+    ("ै", "ai"),
+    ("ो", "o"),
+    ("ौ", "au"),
+    ("ं", "n"),
+    ("ँ", "n"),
+    ("ः", ""),
+    ("्", ""),
+)
+
+
+def _romanize_devanagari(text: str) -> str:
+    romanized = text
+    for devanagari, roman in _ROMANIZATION_REPLACEMENTS:
+        romanized = romanized.replace(devanagari, roman)
+    romanized = re.sub(r"[^A-Za-z0-9\s\"-]", " ", romanized)
+    return re.sub(r"\s+", " ", romanized).strip()
+
+
+def _is_english_query(query: str) -> bool:
+    return not _DEVANAGARI_RE.search(query) and bool(re.search(r"[A-Za-z]", query))
+
+
+def _query_has_nepal_keyword(query: str) -> bool:
+    return bool(re.search(r"(?:\bNepal\b|नेपाल)", query, flags=re.IGNORECASE))
+
+
+def _with_nepal_keyword(query: str) -> str:
+    if _query_has_nepal_keyword(query):
+        return query
+    return f"{query} {'नेपाल' if _DEVANAGARI_RE.search(query) else 'Nepal'}"
+
+
+def _append_english_name_queries(queries: list[str], accused_names: list[str]) -> None:
+    for name in accused_names[:2]:
+        roman_name = _romanize_devanagari(name)
+        if not roman_name or len(roman_name) < 3:
+            continue
+        queries.extend(
+            [
+                f"{roman_name} CIAA case Nepal",
+                f"{roman_name} corruption case Nepal",
+                f"{roman_name} special court corruption Nepal",
+                f"{roman_name} akhtiyar case Nepal",
+            ]
+        )
+
+
+def _normalize_search_queries(queries: list[str]) -> list[str]:
+    normalized = [_with_nepal_keyword(query) for query in queries]
+    english = [query for query in normalized if _is_english_query(query)]
+    devanagari = [query for query in normalized if query not in english]
+    return english[:4] + devanagari + english[4:]
 
 
 def _append_title_keyword_query(queries: list[str], title: str) -> None:
@@ -1216,7 +1327,8 @@ class NewsEnricher:
 
         def _uncovered_events() -> list[str]:
             return [
-                et for et in _ALL_EVENT_TYPES
+                et
+                for et in _ALL_EVENT_TYPES
                 if et not in accepted_event_types and not _would_exceed_event_cap(et)
             ]
 
@@ -1226,9 +1338,10 @@ class NewsEnricher:
             if not _uncovered_events():
                 break
 
-            batch = candidates[batch_start:batch_start + self._CANDIDATE_BATCH_SIZE]
+            batch = candidates[batch_start : batch_start + self._CANDIDATE_BATCH_SIZE]
             fetched = [
-                r for r in self._fetch_candidates_parallel(batch, stats)
+                r
+                for r in self._fetch_candidates_parallel(batch, stats)
                 if r is not None
             ]
 
@@ -1236,8 +1349,14 @@ class NewsEnricher:
                 continue
 
             batch_def = self._verify_candidates_parallel(
-                fetched, case, api_key, stats, press_release_text,
-                accepted, accepted_event_types, event_type_counts,
+                fetched,
+                case,
+                api_key,
+                stats,
+                press_release_text,
+                accepted,
+                accepted_event_types,
+                event_type_counts,
                 _would_exceed_event_cap,
             )
             all_deferred.extend(batch_def)
@@ -1248,13 +1367,21 @@ class NewsEnricher:
             ) // self._CANDIDATE_BATCH_SIZE
             logger.info(
                 "  Batch %d/%d: %d accepted (%d event types), %d deferred",
-                batch_num, total_batches,
-                len(accepted), len(accepted_event_types), len(batch_def),
+                batch_num,
+                total_batches,
+                len(accepted),
+                len(accepted_event_types),
+                len(batch_def),
             )
 
         self._fill_deferred_slots(
-            all_deferred, limit, accepted, accepted_event_types,
-            event_type_counts, stats, _would_exceed_event_cap,
+            all_deferred,
+            limit,
+            accepted,
+            accepted_event_types,
+            event_type_counts,
+            stats,
+            _would_exceed_event_cap,
         )
 
         return accepted
@@ -1279,7 +1406,11 @@ class NewsEnricher:
             for result in fetched:
                 future = executor.submit(
                     self._verify_candidate,
-                    result, case, api_key, stats, press_release_text,
+                    result,
+                    case,
+                    api_key,
+                    stats,
+                    press_release_text,
                 )
                 future_to_result[future] = result
 
@@ -1303,13 +1434,16 @@ class NewsEnricher:
                         stats["accepted"] += 1
                         logger.info(
                             "  Accepted: %s (event: %s, confidence: %s)",
-                            verified["url"][:80], event, verified["confidence"],
+                            verified["url"][:80],
+                            event,
+                            verified["confidence"],
                         )
                     else:
                         deferred.append(verified)
                         logger.debug(
                             "  Deferred (duplicate event %s): %s",
-                            event or "unknown", verified["url"][:80],
+                            event or "unknown",
+                            verified["url"][:80],
                         )
 
         return deferred
@@ -1343,7 +1477,9 @@ class NewsEnricher:
                 remaining -= 1
                 logger.info(
                     "  Accepted (deferred): %s (event: %s, confidence: %s)",
-                    verified["url"][:80], event, verified["confidence"],
+                    verified["url"][:80],
+                    event,
+                    verified["confidence"],
                 )
 
         for verified in deferred:
@@ -1358,7 +1494,9 @@ class NewsEnricher:
             remaining -= 1
             logger.info(
                 "  Accepted (same event): %s (event: %s, confidence: %s)",
-                verified["url"][:80], event, verified["confidence"],
+                verified["url"][:80],
+                event,
+                verified["confidence"],
             )
 
     def _fetch_candidates_parallel(
@@ -1455,7 +1593,11 @@ class NewsEnricher:
             summary = ""
             event_type = ""
 
-        if event_type is None or str(event_type).strip().lower() in {"", "none", "unknown"}:
+        if event_type is None or str(event_type).strip().lower() in {
+            "",
+            "none",
+            "unknown",
+        }:
             event_type = "other"
 
         if not is_relevant:
@@ -2119,7 +2261,9 @@ Excerpt: {article_excerpt}"""
 
         media_news.sort(
             key=lambda indexed: (
-                _EVENT_LIFECYCLE_ORDER.get(indexed[1].get("event_type"), _EVENT_LIFECYCLE_ORDER[_EVENT_OTHER]),
+                _EVENT_LIFECYCLE_ORDER.get(
+                    indexed[1].get("event_type"), _EVENT_LIFECYCLE_ORDER[_EVENT_OTHER]
+                ),
                 indexed[0],
             )
         )
