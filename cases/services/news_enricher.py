@@ -853,7 +853,7 @@ class NewsEnricher:
         llm_base_url: Optional[str] = None,
         llm_api_key: Optional[str] = None,
         max_articles_per_case: int = 5,
-        search_delay: float = 2.0,
+        search_delay: float = 1.5,
         fetch_delay: float = 0.5,
         verbose: bool = False,
     ):

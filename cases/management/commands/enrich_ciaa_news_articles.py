@@ -98,8 +98,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--search-delay",
             type=float,
-            default=2.0,
-            help="Delay in seconds between search queries (default: 2.0)",
+            default=1.5,
+            help="Delay in seconds between search queries (default: 1.5)",
         )
         parser.add_argument(
             "--fetch-delay",
