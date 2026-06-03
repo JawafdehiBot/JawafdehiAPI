@@ -453,18 +453,11 @@ def _with_nepal_keyword(query: str) -> str:
 
 
 def _append_english_name_queries(queries: list[str], accused_names: list[str]) -> None:
-    for name in accused_names[:2]:
-        roman_name = _romanize_devanagari(name)
-        if not roman_name or len(roman_name) < 3:
-            continue
-        queries.extend(
-            [
-                f"{roman_name} CIAA case Nepal",
-                f"{roman_name} corruption case Nepal",
-                f"{roman_name} special court corruption Nepal",
-                f"{roman_name} akhtiyar case Nepal",
-            ]
-        )
+    name = accused_names[0] if accused_names else ""
+    roman_name = _romanize_devanagari(name)
+    if roman_name and len(roman_name) >= 3:
+        queries.append(f"{roman_name} CIAA Nepal corruption")
+        queries.append(f"{roman_name} Nepal special court case")
 
 
 def _normalize_search_queries(queries: list[str]) -> list[str]:
@@ -530,29 +523,17 @@ def _append_event_targeted_queries(queries: list[str], case: Case) -> None:
 
 
 def _detect_case_events(case: Case) -> list[str]:
-    """Detect lifecycle event types for event-targeted search queries.
+    """Return all five lifecycle event types for broad coverage.
 
-    Uses an opportunistic approach: generate queries for all plausible
-    events and rely on LLM filtering to reject irrelevant results.
-    Every CIAA case has a filing and investigation — those are always
-    emitted. Hearing/verdict/appeal are emitted when case dates exist
-    (198-200/200 cases), regardless of whether court_cases has the
-    corresponding court entry.
-
-    NGM integration remains as an optional enhancement — when NGM data
-    is available, hearing/verdict queries can optionally be time-scoped,
-    but the base event detection does not depend on NGM.
+    The LLM filters out irrelevant results, so casting wider is safe.
     """
-    events = [_EVENT_FILING, _EVENT_INVESTIGATION]
-
-    if case.case_start_date:
-        events.append(_EVENT_HEARING)
-
-    if case.case_end_date:
-        events.append(_EVENT_VERDICT)
-        events.append(_EVENT_APPEAL)
-
-    return events
+    return [
+        _EVENT_FILING,
+        _EVENT_INVESTIGATION,
+        _EVENT_HEARING,
+        _EVENT_VERDICT,
+        _EVENT_APPEAL,
+    ]
 
 
 def _fetch_ngm_hearing_data(case: Case) -> Optional[dict]:
@@ -610,16 +591,19 @@ def _build_name_based_queries(case: Case) -> list[str]:
     location = _extract_location_from_title(title)
     org_name = _extract_org_name_from_title(title)
 
-    for name in accused_names[:3]:
+    for idx, name in enumerate(accused_names[:3]):
         name_clean = re.sub(r"\s+", " ", name).strip()
         if not name_clean or len(name_clean) < 3:
             continue
-        if location:
-            queries.append(f'"{name_clean}" {location} भ्रष्टाचार')
-            queries.append(f"{name_clean} {location} अख्तियार")
-        queries.append(f'"{name_clean}" भ्रष्टाचार')
-        queries.append(f'"{name_clean}" अख्तियार')
-        queries.append(f"{name_clean} CIAA corruption")
+        if idx == 0:
+            if location:
+                queries.append(f'"{name_clean}" {location} भ्रष्टाचार')
+                queries.append(f"{name_clean} {location} अख्तियार")
+            queries.append(f'"{name_clean}" भ्रष्टाचार')
+            queries.append(f'"{name_clean}" अख्तियार')
+            queries.append(f"{name_clean} CIAA corruption")
+        else:
+            queries.append(f"{name_clean} CIAA corruption Nepal")
 
     if org_name:
         queries.append(f"{org_name} भ्रष्टाचार")
