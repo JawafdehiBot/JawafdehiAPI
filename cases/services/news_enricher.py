@@ -556,9 +556,13 @@ def _get_accused_names(case: Case) -> list[str]:
     """Extract accused entity names from a case, preferring DB entity relationships."""
     names = []
     try:
-        accused_rels = CaseEntityRelationship.objects.filter(
-            case=case, relationship_type=RelationshipType.ACCUSED
-        ).select_related("entity").order_by("created_at")
+        accused_rels = (
+            CaseEntityRelationship.objects.filter(
+                case=case, relationship_type=RelationshipType.ACCUSED
+            )
+            .select_related("entity")
+            .order_by("created_at")
+        )
         for rel in accused_rels:
             entity_name = rel.entity.display_name or rel.entity.nes_id or ""
             name_clean = entity_name.strip()
