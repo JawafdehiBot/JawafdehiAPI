@@ -177,6 +177,21 @@ class TestNewsEnricherService:
         queries = _generate_query_variations(case)
         assert isinstance(queries, list)
 
+    def test_generate_query_variations_reserves_event_slots(self):
+        case = self._create_case(
+            title="लामो शीर्षक भ्रष्टाचार अनियमितता घुस रकम जग्गा खरिद निर्माण ठेक्का",
+            court_cases=["special:080-CR-0007"],
+            case_start_date=date(2023, 7, 1),
+            case_end_date=date(2024, 6, 12),
+            key_allegations=["घुस रिश्वत भ्रष्टाचार अनियमितता अकुत सम्पत्ति"],
+        )
+
+        queries = _generate_query_variations(case)
+
+        assert len(queries) <= 10
+        assert any("मुद्दा दायर" in query for query in queries)
+        assert any("फैसला विशेष अदालत" in query for query in queries)
+
     def test_extract_text_from_html(self):
         html = self._get_sample_html(body="This is article content. " * 20)
         text = _extract_text_from_html(html)

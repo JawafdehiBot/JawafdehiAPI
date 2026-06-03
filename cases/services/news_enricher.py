@@ -310,14 +310,28 @@ def _generate_query_variations(case: Case) -> list[str]:
     case_number = _resolve_case_number(case)
     title = case.title or ""
 
-    queries = _build_name_based_queries(case)
-    _append_title_keyword_query(queries, title)
-    _append_accused_corruption_queries(queries, case)
-    _append_location_queries(queries, case, title)
-    _append_event_targeted_queries(queries, case)
+    event_queries: list[str] = []
+    _append_event_targeted_queries(event_queries, case)
 
-    deduped = _deduplicate_queries(queries, case_number, _get_accused_names(case))
-    return deduped[:10]
+    general_queries = _build_name_based_queries(case)
+    _append_title_keyword_query(general_queries, title)
+    _append_accused_corruption_queries(general_queries, case)
+    _append_location_queries(general_queries, case, title)
+
+    deduped_events = _deduplicate_queries(
+        event_queries, case_number, _get_accused_names(case)
+    )
+    deduped_general = _deduplicate_queries(
+        general_queries, case_number, _get_accused_names(case)
+    )
+
+    reserved_event_slots = min(4, len(deduped_events))
+    combined = (
+        deduped_events[:reserved_event_slots]
+        + deduped_general[: 10 - reserved_event_slots]
+        + deduped_events[reserved_event_slots:]
+    )
+    return _deduplicate_queries(combined, case_number, _get_accused_names(case))[:10]
 
 
 def _append_title_keyword_query(queries: list[str], title: str) -> None:
