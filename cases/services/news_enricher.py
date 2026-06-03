@@ -1199,7 +1199,7 @@ class NewsEnricher:
 
         accepted = []
         accepted_event_types: set[str] = set()
-        event_type_counts: dict[str, int] = {}
+        event_type_counts = self._get_existing_event_type_counts(case)
         deferred: list[dict] = []
 
         def _would_exceed_event_cap(event: str) -> bool:
@@ -1234,7 +1234,7 @@ class NewsEnricher:
                     continue
                 if verified:
                     event = verified.get("event_type", "")
-                    if event and event not in accepted_event_types:
+                    if event and event not in accepted_event_types and not _would_exceed_event_cap(event):
                         accepted.append(verified)
                         accepted_event_types.add(event)
                         event_type_counts[event] = event_type_counts.get(event, 0) + 1
@@ -1260,7 +1260,7 @@ class NewsEnricher:
             if remaining <= 0:
                 break
             event = verified.get("event_type", "")
-            if event and event not in accepted_event_types:
+            if event and event not in accepted_event_types and not _would_exceed_event_cap(event):
                 accepted.append(verified)
                 accepted_event_types.add(event)
                 event_type_counts[event] = event_type_counts.get(event, 0) + 1
@@ -1425,6 +1425,37 @@ class NewsEnricher:
             for entry in evidence
             if isinstance(entry, dict) and entry.get("source_id")
         }
+
+    def _get_existing_event_type_counts(self, case: Case) -> dict[str, int]:
+        """Count existing MEDIA_NEWS evidence entries by event_type."""
+        evidence = case.evidence or []
+        source_ids = self._extract_source_ids_from_evidence(evidence)
+        if not source_ids:
+            return {}
+
+        try:
+            media_news_source_ids = set(
+                DocumentSource.objects.filter(
+                    source_id__in=source_ids,
+                    source_type=SourceType.MEDIA_NEWS,
+                ).values_list("source_id", flat=True)
+            )
+        except Exception:
+            logger.exception("Failed to load existing MEDIA_NEWS event types")
+            close_old_connections()
+            return {}
+
+        counts: dict[str, int] = {}
+        for entry in evidence:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("source_id") not in media_news_source_ids:
+                continue
+            event_type = entry.get("event_type")
+            if not event_type:
+                continue
+            counts[event_type] = counts.get(event_type, 0) + 1
+        return counts
 
     def _index_source_url(
         self, urls: set[str], url_map: dict[str, str], source
@@ -1967,12 +1998,7 @@ Excerpt: {article_excerpt}"""
                 if existing_source_id:
                     if existing_source_id not in existing_source_ids:
                         evidence.append(
-                            {
-                                "source_id": existing_source_id,
-                                "description": self._build_evidence_description(
-                                    article
-                                ),
-                            }
+                            self._build_evidence_entry(existing_source_id, article)
                         )
                         existing_source_ids.add(existing_source_id)
                     continue
@@ -1984,12 +2010,7 @@ Excerpt: {article_excerpt}"""
                 new_count += 1
 
                 if source.source_id not in existing_source_ids:
-                    evidence.append(
-                        {
-                            "source_id": source.source_id,
-                            "description": self._build_evidence_description(article),
-                        }
-                    )
+                    evidence.append(self._build_evidence_entry(source.source_id, article))
                     existing_source_ids.add(source.source_id)
 
             case.evidence = evidence
@@ -2034,6 +2055,17 @@ Excerpt: {article_excerpt}"""
         if pub_date:
             return f"News article from {outlet} ({pub_date.isoformat()})."
         return f"News article from {outlet}."
+
+    def _build_evidence_entry(self, source_id: str, article: dict) -> dict:
+        """Build case evidence entry for a MEDIA_NEWS source."""
+        entry = {
+            "source_id": source_id,
+            "description": self._build_evidence_description(article),
+        }
+        event_type = article.get("event_type")
+        if event_type:
+            entry["event_type"] = event_type
+        return entry
 
     def _build_evidence_description(self, article: dict) -> str:
         """Build evidence entry description in Nepali."""

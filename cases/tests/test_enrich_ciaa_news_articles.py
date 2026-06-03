@@ -258,6 +258,48 @@ class TestNewsEnricherService:
 
         assert _MAX_ARTICLES_PER_EVENT_TYPE == 2
 
+    def test_evidence_entry_stores_event_type(self):
+        enricher = self._create_enricher()
+        entry = enricher._build_evidence_entry(
+            "source-1",
+            {"url": "https://example.com/news", "event_type": "appeal"},
+        )
+        assert entry["source_id"] == "source-1"
+        assert entry["event_type"] == "appeal"
+        assert entry["description"]
+
+    def test_existing_event_type_counts_only_media_news_with_event_type(self):
+        case = self._create_case()
+        media_filing = DocumentSource.objects.create(
+            title="Filing",
+            source_type=SourceType.MEDIA_NEWS,
+            url=["https://example.com/filing"],
+            publication_date=date(2025, 1, 15),
+        )
+        old_media = DocumentSource.objects.create(
+            title="Old",
+            source_type=SourceType.MEDIA_NEWS,
+            url=["https://example.com/old"],
+            publication_date=date(2025, 1, 16),
+        )
+        other_source = DocumentSource.objects.create(
+            title="Other",
+            source_type=SourceType.OFFICIAL_GOVERNMENT,
+            url=["https://ciaa.gov.np/press"],
+            publication_date=date(2025, 1, 17),
+        )
+        case.evidence = [
+            {"source_id": media_filing.source_id, "event_type": "filing"},
+            {"source_id": old_media.source_id},
+            {"source_id": other_source.source_id, "event_type": "filing"},
+        ]
+        case.save(update_fields=["evidence"])
+
+        enricher = self._create_enricher()
+        counts = enricher._get_existing_event_type_counts(case)
+
+        assert counts == {"filing": 1}
+
     def test_search_candidates_runs_queries_sequentially_with_delay(self):
         enricher = self._create_enricher()
         enricher.search_delay = 2.0
