@@ -1374,10 +1374,17 @@ class Command(BaseCommand):
                         "LLM opencode: choice[0] has neither message nor delta — using raw=%s",
                         raw[:100] if raw else "(empty)",
                     )
+                response_model = payload.get("model", "")
                 logger.info(
-                    "LLM opencode: attempt %d succeeded — response_len=%d",
+                    "LLM opencode: attempt %d succeeded — response_len=%d model=%s request_model=%s",
                     attempt,
                     len(raw),
+                    response_model,
+                    normalized_model,
+                )
+                assert response_model == normalized_model, (
+                    f"Model mismatch: sent {normalized_model!r} but "
+                    f"response from {response_model!r}"
                 )
                 return _extract_json_body(raw)
             except urllib.error.HTTPError as exc:
@@ -1450,10 +1457,17 @@ class Command(BaseCommand):
                         f"LLM returned empty response after {MAX_LLM_RETRIES} attempts"
                     )
                 raw = response.content[0].text
+                response_model = getattr(response, "model", "")
                 logger.info(
-                    "LLM anthropic: attempt %d succeeded — response_len=%d",
+                    "LLM anthropic: attempt %d succeeded — response_len=%d model=%s request_model=%s",
                     attempt + 1,
                     len(raw),
+                    response_model,
+                    model,
+                )
+                assert response_model == model, (
+                    f"Model mismatch: sent {model!r} but "
+                    f"response from {response_model!r}"
                 )
                 return _extract_json_body(raw)
             except Exception as exc:
