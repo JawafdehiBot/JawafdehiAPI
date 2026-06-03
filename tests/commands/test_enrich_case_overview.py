@@ -22,26 +22,26 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from django.core.management import call_command, CommandError
+from django.core.management import CommandError, call_command
 
 from cases.management.commands.enrich_case_overview import (
+    _CLOUD_METADATA_IP,
     Command,
-    _validate_host_safety,
-    _SafeRedirectHandler,
-    _sanitize_download_filename,
     _confined_output_path,
-    _extract_json_body,
     _copy_stream_to_path_with_limit,
-    normalize_model,
-    normalize_base_url,
+    _extract_json_body,
+    _has_charge_sheet_keywords,
+    _has_ngm_store_url,
+    _has_press_release_keywords,
+    _is_direct_document_url,
     _llm_endpoint,
     _llm_timeout,
-    _has_charge_sheet_keywords,
-    _has_press_release_keywords,
-    _has_ngm_store_url,
-    _is_direct_document_url,
+    _SafeRedirectHandler,
+    _sanitize_download_filename,
     _source_url_priority,
-    _CLOUD_METADATA_IP,
+    _validate_host_safety,
+    normalize_base_url,
+    normalize_model,
 )
 from cases.models import Case, CaseState, CaseType, DocumentSource, SourceType
 
