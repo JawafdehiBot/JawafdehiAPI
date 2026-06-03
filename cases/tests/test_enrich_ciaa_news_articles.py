@@ -239,6 +239,20 @@ class TestNewsEnricherService:
         names = _get_accused_names(case)
         assert "गोपाल पराजुली" in names
 
+    def test_get_accused_names_primary_first(self):
+        case = self._create_case()
+        primary = JawafEntity.objects.create(display_name="राजु पुरी")
+        CaseEntityRelationship.objects.create(
+            case=case, entity=primary, relationship_type=RelationshipType.ACCUSED
+        )
+        coaccused = JawafEntity.objects.create(display_name="श्रृजना गिरी")
+        CaseEntityRelationship.objects.create(
+            case=case, entity=coaccused, relationship_type=RelationshipType.ACCUSED
+        )
+        names = _get_accused_names(case)
+        assert names[0] == "राजु पुरी"
+        assert names[1] == "श्रृजना गिरी"
+
     def test_event_cap_constant(self):
         from cases.services.news_enricher import _MAX_ARTICLES_PER_EVENT_TYPE
 

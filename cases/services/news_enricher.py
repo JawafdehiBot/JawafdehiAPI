@@ -558,7 +558,7 @@ def _get_accused_names(case: Case) -> list[str]:
     try:
         accused_rels = CaseEntityRelationship.objects.filter(
             case=case, relationship_type=RelationshipType.ACCUSED
-        ).select_related("entity")
+        ).select_related("entity").order_by("created_at")
         for rel in accused_rels:
             entity_name = rel.entity.display_name or rel.entity.nes_id or ""
             name_clean = entity_name.strip()
