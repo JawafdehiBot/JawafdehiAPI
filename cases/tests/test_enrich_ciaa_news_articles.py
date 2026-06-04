@@ -66,28 +66,59 @@ class TestNewsEnricherService:
         return Case.objects.create(**defaults)
 
     def _mock_llm_response(
-        self, relevant=True, confidence="high", reason="Match", summary=""
+        self, relevant=True, confidence="high", reason="Match", event_type="filing"
     ):
-        if not summary:
-            summary = (
-                "A corruption case article summary."
-                if relevant
-                else "Unrelated article summary."
-            )
-        inner_json = json.dumps(
-            {
-                "relevant": relevant,
-                "confidence": confidence,
-                "reason": reason,
-                "summary": summary,
-            }
-        )
+        inner = {
+            "relevant": relevant,
+            "confidence": confidence,
+            "reason": reason,
+        }
+        if relevant:
+            inner["event_type"] = event_type
+        inner_json = json.dumps(inner)
         outer_payload = json.dumps({"choices": [{"message": {"content": inner_json}}]})
         mock_response = MagicMock()
         mock_response.raise_for_status.return_value = None
         mock_response.json.return_value = json.loads(outer_payload)
         mock_response.text = outer_payload
         return mock_response
+
+    def _mock_summary_response(self, summary_text="Nepali summary."):
+        inner_json = json.dumps({"summary": summary_text})
+        outer_payload = json.dumps({"choices": [{"message": {"content": inner_json}}]})
+        mock_response = MagicMock()
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.return_value = json.loads(outer_payload)
+        mock_response.text = outer_payload
+        return mock_response
+
+    def _mock_dual_llm_post(self, relevant=True, confidence="high", reason="Match",
+                            event_type="filing", summary_text="Nepali summary."):
+        """Return a side_effect function that routes requests.post to verify vs summary LLM."""
+        verify_inner = {"relevant": relevant, "confidence": confidence, "reason": reason}
+        if relevant:
+            verify_inner["event_type"] = event_type
+        verify_payload = json.dumps({"choices": [{"message": {"content": json.dumps(verify_inner)}}]})
+        summ_payload = json.dumps({"choices": [{"message": {"content": json.dumps({"summary": summary_text})}}]})
+
+        def _route(*args, **kwargs):
+            content = ""
+            try:
+                for m in kwargs.get("json", {}).get("messages", []):
+                    if m.get("role") == "user":
+                        content = m.get("content", "")
+            except Exception:
+                pass
+            r = MagicMock()
+            r.raise_for_status.return_value = None
+            if "summary" in content.lower():
+                r.text = summ_payload
+                r.json.return_value = json.loads(summ_payload)
+            else:
+                r.text = verify_payload
+                r.json.return_value = json.loads(verify_payload)
+            return r
+        return _route
 
     def _get_sample_html(self, title="Test Article", body=None):
         if body is None:
@@ -141,6 +172,8 @@ class TestNewsEnricherService:
             llm_api_key="test-key",
             llm_base_url="https://test-llm.example.com/v1",
             max_articles_per_case=max_articles_per_case,
+            search_delay=0,
+            fetch_delay=0,
         )
 
     _FETCH_UNSET = object()
@@ -152,7 +185,6 @@ class TestNewsEnricherService:
         llm_relevant=True,
         confidence="high",
         reason="Match",
-        summary="",
     ):
         if search_results is None:
             search_results = self._mock_search_results()
@@ -169,11 +201,8 @@ class TestNewsEnricherService:
         )
         p3 = patch(
             "requests.post",
-            return_value=self._mock_llm_response(
-                relevant=llm_relevant,
-                confidence=confidence,
-                reason=reason,
-                summary=summary,
+            side_effect=self._mock_dual_llm_post(
+                relevant=llm_relevant, confidence=confidence, reason=reason
             ),
         )
         return p1, p2, p3
@@ -282,7 +311,7 @@ class TestNewsEnricherService:
     def test_event_cap_constant(self):
         from cases.services.news_enricher import _MAX_ARTICLES_PER_EVENT_TYPE
 
-        assert _MAX_ARTICLES_PER_EVENT_TYPE == 2
+        assert _MAX_ARTICLES_PER_EVENT_TYPE == 1
 
     def test_evidence_entry_stores_event_type(self):
         enricher = self._create_enricher()
@@ -515,6 +544,8 @@ class TestNewsEnricherService:
             llm_api_key="test-key",
             llm_base_url="https://test-llm.example.com/v1",
             max_articles_per_case=3,
+            search_delay=0,
+            fetch_delay=0,
         )
 
         search_results = self._mock_search_results(prefix="evdup-test")
@@ -527,7 +558,27 @@ class TestNewsEnricherService:
         ), patch(
             "requests.post",
         ) as mock_post:
-            mock_post.return_value = self._mock_llm_response()
+            verify = json.dumps({"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"})
+            summ = json.dumps({"summary": "Dup evidence summary."})
+
+            def _dup_side(*a, **kw):
+                r = MagicMock()
+                r.raise_for_status.return_value = None
+                msg = ""
+                try:
+                    for m in kw.get("json", {}).get("messages", []):
+                        if m.get("role") == "user":
+                            msg = m.get("content", "")
+                except Exception:
+                    pass
+                if "summary" in msg.lower():
+                    r.text = summ
+                    r.json.return_value = json.loads(summ)
+                else:
+                    r.text = verify
+                    r.json.return_value = json.loads(verify)
+                return r
+            mock_post.side_effect = _dup_side
 
             enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
 
@@ -550,17 +601,13 @@ class TestNewsEnricherService:
             search_results=search_results,
             fetch_html=html,
             reason="Case number matches.",
-            summary="CIAA filed a case against the survey office chief at Chabahil for illegal assets.",
         )
         with p1, p2, p3:
             enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
 
             source = DocumentSource.objects.first()
             assert source is not None
-            assert (
-                source.description
-                == "CIAA filed a case against the survey office chief at Chabahil for illegal assets."
-            )
+            assert source.description == "Nepali summary."
 
     def test_publication_date_stored(self):
         case = self._create_case()
@@ -610,7 +657,27 @@ class TestNewsEnricherService:
         ), patch(
             "requests.post",
         ) as mock_post:
-            mock_post.return_value = self._mock_llm_response()
+            verify = json.dumps({"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"})
+            summ = json.dumps({"summary": "Search error test summary."})
+
+            def _search_err_side(*a, **kw):
+                r = MagicMock()
+                r.raise_for_status.return_value = None
+                msg = ""
+                try:
+                    for m in kw.get("json", {}).get("messages", []):
+                        if m.get("role") == "user":
+                            msg = m.get("content", "")
+                except Exception:
+                    pass
+                if "summary" in msg.lower():
+                    r.text = summ
+                    r.json.return_value = json.loads(summ)
+                else:
+                    r.text = verify
+                    r.json.return_value = json.loads(verify)
+                return r
+            mock_post.side_effect = _search_err_side
 
             stats = enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
             assert stats["errors"] >= 1
@@ -670,7 +737,27 @@ class TestNewsEnricherService:
             mock_fetch.return_value = self._get_sample_html()
 
             with patch("requests.post") as mock_post:
-                mock_post.return_value = self._mock_llm_response()
+                verify = json.dumps({"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"})
+                summ = json.dumps({"summary": "Linked article summary."})
+
+                def _link_side(*a, **kw):
+                    r = MagicMock()
+                    r.raise_for_status.return_value = None
+                    msg = ""
+                    try:
+                        for m in kw.get("json", {}).get("messages", []):
+                            if m.get("role") == "user":
+                                msg = m.get("content", "")
+                    except Exception:
+                        pass
+                    if "summary" in msg.lower():
+                        r.text = summ
+                        r.json.return_value = json.loads(summ)
+                    else:
+                        r.text = verify
+                        r.json.return_value = json.loads(verify)
+                    return r
+                mock_post.side_effect = _link_side
                 stats = enricher.enrich_case(
                     case, dry_run=False, case_num=1, total_cases=1
                 )
@@ -734,10 +821,8 @@ class TestNewsEnricherService:
             "cases.services.news_enricher._fetch_article_content",
             return_value=self._get_sample_html(body="Fallback article content. " * 50),
         ), patch("requests.post") as mock_post:
-            mock_post.return_value = self._mock_llm_response(
-                relevant=True,
-                reason="Match via fallback.",
-                summary="A fallback-matched article summary.",
+            mock_post.side_effect = self._mock_dual_llm_post(
+                relevant=True, reason="Match via fallback."
             )
 
             stats = enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
@@ -778,6 +863,7 @@ class TestNewsEnricherService:
         with p1, p2, p3:
             stats = enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
             assert stats["accepted"] <= 2
+            assert stats["new_sources"] <= 2
 
 
 @pytest.mark.django_db
@@ -835,18 +921,35 @@ class TestEnrichCiaaNewsArticlesCommand:
         ), patch(
             "requests.post",
         ) as mock_post:
-            mock_llm = MagicMock()
-            mock_llm.raise_for_status.return_value = None
-            mock_llm.json.return_value = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"relevant": true, "confidence": "high", "reason": "Match"}'
-                        }
-                    }
-                ]
-            }
-            mock_post.return_value = mock_llm
+            verify_inner = json.dumps(
+                {"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"}
+            )
+            summary_inner = json.dumps({"summary": "नागरिकले मुद्दाको सारांश।"})
+            verify_payload = json.dumps(
+                {"choices": [{"message": {"content": verify_inner}}]}
+            )
+            summary_payload = json.dumps(
+                {"choices": [{"message": {"content": summary_inner}}]}
+            )
+
+            def _mock_llm_for_test(*args, **kwargs):
+                content = ""
+                try:
+                    for m in kwargs.get("json", {}).get("messages", []):
+                        if m.get("role") == "user":
+                            content = m.get("content", "")
+                except Exception:
+                    pass
+                resp = MagicMock()
+                resp.raise_for_status.return_value = None
+                if "summary" in content.lower():
+                    resp.text = summary_payload
+                    resp.json.return_value = json.loads(summary_payload)
+                else:
+                    resp.text = verify_payload
+                    resp.json.return_value = json.loads(verify_payload)
+                return resp
+            mock_post.side_effect = _mock_llm_for_test
 
             out = StringIO()
             call_command(
@@ -855,6 +958,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                 f"--case-id={case.case_id}",
                 "--llm-api-key=test-key",
                 "--llm-base-url=https://test.example.com/v1",
+                "--search-delay=0",
                 stdout=out,
             )
 
@@ -879,18 +983,31 @@ class TestEnrichCiaaNewsArticlesCommand:
         ), patch(
             "requests.post",
         ) as mock_post:
-            mock_llm = MagicMock()
-            mock_llm.raise_for_status.return_value = None
-            mock_llm.json.return_value = {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"relevant": false, "reason": "No match"}'
-                        }
-                    }
-                ]
-            }
-            mock_post.return_value = mock_llm
+            verify_payload = json.dumps(
+                {"choices": [{"message": {"content": '{"relevant": false, "reason": "No match"}'}}]}
+            )
+            summ_payload = json.dumps(
+                {"choices": [{"message": {"content": '{"summary": ""}'}}]}
+            )
+
+            def _case_side(*a, **kw):
+                r = MagicMock()
+                r.raise_for_status.return_value = None
+                msg = ""
+                try:
+                    for m in kw.get("json", {}).get("messages", []):
+                        if m.get("role") == "user":
+                            msg = m.get("content", "")
+                except Exception:
+                    pass
+                if "summary" in msg.lower():
+                    r.text = summ_payload
+                    r.json.return_value = json.loads(summ_payload)
+                else:
+                    r.text = verify_payload
+                    r.json.return_value = json.loads(verify_payload)
+                return r
+            mock_post.side_effect = _case_side
 
             out = StringIO()
             call_command(
@@ -899,6 +1016,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                 f"--case-id={case_a.case_id}",
                 "--llm-api-key=test-key",
                 "--llm-base-url=https://test.example.com/v1",
+                "--search-delay=0",
                 stdout=out,
             )
 
@@ -959,14 +1077,31 @@ class TestEnrichCiaaNewsArticlesCommand:
         ), patch(
             "requests.post",
         ) as mock_post:
-            mock_llm = MagicMock()
-            mock_llm.raise_for_status.return_value = None
-            mock_llm.json.return_value = {
-                "choices": [
-                    {"message": {"content": '{"relevant": false, "reason": "No"}'}}
-                ]
-            }
-            mock_post.return_value = mock_llm
+            verify_payload = json.dumps(
+                {"choices": [{"message": {"content": '{"relevant": false, "reason": "No"}'}}]}
+            )
+            summ_payload = json.dumps(
+                {"choices": [{"message": {"content": '{"summary": ""}'}}]}
+            )
+
+            def _limit_side(*a, **kw):
+                r = MagicMock()
+                r.raise_for_status.return_value = None
+                msg = ""
+                try:
+                    for m in kw.get("json", {}).get("messages", []):
+                        if m.get("role") == "user":
+                            msg = m.get("content", "")
+                except Exception:
+                    pass
+                if "summary" in msg.lower():
+                    r.text = summ_payload
+                    r.json.return_value = json.loads(summ_payload)
+                else:
+                    r.text = verify_payload
+                    r.json.return_value = json.loads(verify_payload)
+                return r
+            mock_post.side_effect = _limit_side
 
             out = StringIO()
             call_command(
@@ -975,6 +1110,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                 "--dry-run",
                 "--llm-api-key=test-key",
                 "--llm-base-url=https://test.example.com/v1",
+                "--search-delay=0",
                 stdout=out,
             )
 
@@ -995,6 +1131,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                 "--dry-run",
                 "--llm-api-key=test-key",
                 "--llm-base-url=https://test.example.com/v1",
+                "--search-delay=0",
                 stdout=out,
             )
 
@@ -1022,6 +1159,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                 "--dry-run",
                 "--llm-api-key=test-key",
                 "--llm-base-url=https://test.example.com/v1",
+                "--search-delay=0",
                 stdout=out,
             )
 
@@ -1042,6 +1180,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                 "--dry-run",
                 "--llm-api-key=test-key",
                 "--llm-base-url=https://test.example.com/v1",
+                "--search-delay=0",
                 stdout=out,
             )
 

@@ -159,10 +159,10 @@ CIAA Special Court corruption case as the case described below.
 You must respond with ONLY a JSON object in one of these two formats:
 
 If the article IS about the same case:
-{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case.", "summary": "संक्षिप्त सारांश (१-२ वाक्यमा नेपालीमा लेख्नुहोस्): यस समाचारले के भनेको छ — को संलग्न छ, के भयो, मुख्य तथ्यहरू। यो सार्वजनिक रूपमा देखाइने विवरण हो।", "event_type": "investigation|filing|hearing|verdict|appeal|other"}
+{"relevant": true, "confidence": "high|medium|low", "reason": "Brief explanation in English of why this article matches the case.", "event_type": "investigation|filing|hearing|verdict|appeal|other"}
 
 If the article is NOT about the same case:
-{"relevant": false, "reason": "Brief explanation in English of why this article does not match.", "summary": "A concise 1-3 sentence summary of what the news article reports."}
+{"relevant": false, "reason": "Brief explanation in English of why this article does not match."}
 
 Event types for the "event_type" field:
 - "investigation" — CIAA is investigating or completed investigation phase
@@ -178,8 +178,18 @@ Rules:
 - Matching on defendant name + corruption allegations is medium evidence.
 - If the article is about a different corruption case involving the same person, it is NOT relevant.
 - If the article is about the same person but not about corruption allegations, it is NOT relevant.
-- The "summary" field should describe the article content itself in Nepali, not how the LLM matched it to the case.
 - The "event_type" field is required when relevant=true. Never return an empty string. Use "other" if the article is relevant but does not clearly fit the above categories.
+"""
+
+_SUMMARY_SYSTEM_PROMPT = """\
+You are a Nepal news summarizer. Generate a concise 1-2 sentence Nepali summary
+of the following news article about a CIAA corruption case.
+
+Respond with ONLY a JSON object:
+{"summary": "संक्षिप्त सारांश (१-२ वाक्यमा नेपालीमा): यस समाचारले के भनेको छ — को संलग्न छ, के भयो, मुख्य तथ्यहरू।"}
+
+The summary must be in Nepali (Devanagari script). It should describe what the
+article reports, not how it relates to the case.
 """
 
 
@@ -1429,6 +1439,7 @@ class NewsEnricher:
             accepted_event_types,
             event_type_counts,
             stats,
+            api_key,
             _would_exceed_event_cap,
         )
 
@@ -1476,6 +1487,14 @@ class NewsEnricher:
                         and event not in accepted_event_types
                         and not _would_exceed_event_cap(event)
                     ):
+                        # Generate Nepali summary for accepted article via
+                        # lightweight follow-up call (separate from verification).
+                        if api_key and self.llm_base_url:
+                            article_text = verified.get("_article_text", "")
+                            article_title = verified.get("title", "")
+                            verified["summary"] = self._generate_summary(
+                                article_text, article_title, api_key
+                            )
                         accepted.append(verified)
                         accepted_event_types.add(event)
                         event_type_counts[event] = event_type_counts.get(event, 0) + 1
@@ -1504,6 +1523,7 @@ class NewsEnricher:
         accepted_event_types: set[str],
         event_type_counts: dict[str, int],
         stats: dict,
+        api_key: Optional[str],
         _would_exceed_event_cap,
     ) -> None:
         """Fill remaining accepted slots from deferred candidates."""
@@ -1519,6 +1539,7 @@ class NewsEnricher:
                 and event not in accepted_event_types
                 and not _would_exceed_event_cap(event)
             ):
+                self._fill_deferred_summary(verified, api_key)
                 accepted.append(verified)
                 accepted_event_types.add(event)
                 event_type_counts[event] = event_type_counts.get(event, 0) + 1
@@ -1540,6 +1561,7 @@ class NewsEnricher:
             event = verified.get("event_type", "")
             if event and _would_exceed_event_cap(event):
                 continue
+            self._fill_deferred_summary(verified, api_key)
             accepted.append(verified)
             event_type_counts[event] = event_type_counts.get(event, 0) + 1
             stats["accepted"] += 1
@@ -1613,6 +1635,59 @@ class NewsEnricher:
                 results.append(result)
         return results
 
+    @staticmethod
+    def _trim_excerpt(text: str, max_chars: int = 1500, devanagari_max: int = 1000) -> str:
+        """Trim article excerpt with Devanagari-aware limit.
+
+        Devanagari is multi-byte in UTF-8 and tokenizes denser than English.
+        Use a shorter limit for Nepali-dominant content to reduce LLM
+        truncation risk.
+        """
+        if _DEVANAGARI_RE.search(text):
+            return text[:devanagari_max]
+        return text[:max_chars]
+
+    def _generate_summary(
+        self,
+        article_text: str,
+        article_title: str,
+        api_key: str,
+    ) -> str:
+        """Generate a Nepali summary for an accepted article via lightweight LLM call."""
+        user_prompt = f"""Generate a Nepali summary of this news article.
+
+Title: {article_title}
+Article text:
+{article_text[:2000]}"""
+        result = _call_llm(
+            system_prompt=_SUMMARY_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            model=self.llm_model,
+            base_url=self.llm_base_url,
+            api_key=api_key,
+            timeout=60,
+            max_retries=1,
+        )
+        if result and isinstance(result, dict):
+            return result.get("summary", "")
+        return ""
+
+    def _fill_deferred_summary(self, verified: dict, api_key: Optional[str]) -> None:
+        """Generate summary for a deferred-accepted article if missing.
+
+        Deferred articles bypassed _verify_candidates_parallel and may not
+        have a summary yet. This lightweight call only fires when needed.
+        """
+        if verified.get("summary"):
+            return  # already populated
+        if not api_key or not self.llm_base_url:
+            return
+        verified["summary"] = self._generate_summary(
+            article_text=verified.get("_article_text", ""),
+            article_title=verified.get("title", ""),
+            api_key=api_key,
+        )
+
     def _verify_candidate(
         self,
         fetch_result: dict,
@@ -1621,19 +1696,33 @@ class NewsEnricher:
         stats: dict,
         press_release_text: Optional[str] = None,
     ) -> Optional[dict]:
-        """Run LLM verification on a single fetched article. Returns accepted dict or None."""
+        """Run LLM verification on a single fetched article. Returns accepted dict or None.
+
+        Skips LLM verification entirely when article body is empty (paywalled,
+        404, bot-blocked) — rejects with "could not fetch article content".
+        """
         candidate = fetch_result["candidate"]
         url = candidate["url"]
         article_text = fetch_result["article_text"]
         article_title = fetch_result["article_title"]
 
+        # Skip LLM call when article body is empty — title-only content from
+        # paywalled/404/bot-blocked pages would waste tokens and risk false acceptance.
+        article_body = (article_text or "").strip()
+        article_title_clean = (article_title or "").strip()
+        if not article_body or len(article_body) < 100:
+            stats["rejected"] += 1
+            logger.debug("  rejected: %s — could not fetch article content", url[:80])
+            return None
+
         if api_key and self.llm_base_url:
-            is_relevant, confidence, reason, summary, event_type = (
+            excerpt = self._trim_excerpt(article_body)
+            is_relevant, confidence, reason, event_type = (
                 self._verify_article_relevance(
                     case=case,
-                    article_title=article_title,
+                    article_title=article_title_clean,
                     article_url=url,
-                    article_excerpt=article_text[:1500],
+                    article_excerpt=excerpt,
                     api_key=api_key,
                     press_release_text=press_release_text,
                 )
@@ -1642,7 +1731,6 @@ class NewsEnricher:
             is_relevant = False
             confidence = "none"
             reason = "LLM not configured"
-            summary = ""
             event_type = ""
 
         if event_type is None or str(event_type).strip().lower() in {
@@ -1651,7 +1739,7 @@ class NewsEnricher:
             "unknown",
         }:
             inferred = _infer_event_type_from_reason(
-                reason, article_title, event_type or ""
+                reason, article_title_clean, event_type or ""
             )
             event_type = inferred if inferred else "other"
 
@@ -1664,13 +1752,14 @@ class NewsEnricher:
             return None
 
         return {
-            "title": article_title,
+            "title": article_title_clean,
             "url": url,
             "publication_date": fetch_result.get("article_date"),
             "confidence": confidence,
             "reason": reason,
-            "summary": summary,
+            "summary": "",  # populated by _generate_summary in _verify_candidates_parallel after acceptance
             "event_type": event_type or "",
+            "_article_text": article_body,  # kept for follow-up summary generation; not saved
         }
 
     @staticmethod
@@ -1985,10 +2074,12 @@ class NewsEnricher:
         article_excerpt: str,
         api_key: str,
         press_release_text: Optional[str] = None,
-    ) -> tuple[bool, str, str, str, str]:
+    ) -> tuple[bool, str, str, str]:
         """Use LLM to verify if an article is about the same case.
 
-        Returns (is_relevant, confidence, reason, summary).
+        Returns (is_relevant, confidence, reason, event_type).
+        Summary is NOT generated here — a separate lightweight call
+        (_generate_summary) handles it for accepted articles only.
         """
         case_number = _resolve_case_number(case)
 
@@ -2036,12 +2127,11 @@ Excerpt: {article_excerpt}"""
         )
 
         if result is None:
-            return False, "error", "LLM response could not be parsed", "", ""
+            return False, "error", "LLM response could not be parsed", ""
 
         relevant = result.get("relevant", False)
         confidence = result.get("confidence", "medium")
         reason = result.get("reason", "")
-        summary = result.get("summary", "")
         event_type = result.get("event_type", "")
 
         logger.debug(
@@ -2053,7 +2143,7 @@ Excerpt: {article_excerpt}"""
             reason,
         )
 
-        return relevant, confidence, reason, summary, event_type
+        return relevant, confidence, reason, event_type
 
     def _get_press_release_content(self, case: Case) -> Optional[str]:
         """Extract press release text for a CIAA case from evidence-linked sources.
