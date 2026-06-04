@@ -1197,7 +1197,9 @@ class Command(BaseCommand):
         else:
             primary = None
         if primary:
-            self.stdout.write(self._safe_output_text(f"  Source: {self._describe_source(primary)}"))
+            self.stdout.write(
+                self._safe_output_text(f"  Source: {self._describe_source(primary)}")
+            )
         self.stdout.write(
             f"  Gathered: charge_sheet={'yes' if source_texts['charge_sheet'] else 'no'}, "
             f"press_releases={len(source_texts['press_releases'])}, "
@@ -1867,7 +1869,9 @@ class Command(BaseCommand):
         logger.warning("Case %s: skipped — %s", case.case_id, note)
         if not dry_run:
             self._record_missing_details(case, f"enrich_case_overview: {note}")
-        self.stdout.write(self.style.WARNING(self._safe_output_text(f"  SKIPPED: {note}")))
+        self.stdout.write(
+            self.style.WARNING(self._safe_output_text(f"  SKIPPED: {note}"))
+        )
 
     def _record_missing_details(self, case, note):
         current = case.missing_details or ""
