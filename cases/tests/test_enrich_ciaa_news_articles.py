@@ -281,7 +281,9 @@ class TestNewsEnricherService:
 
         assert len(english_queries) >= 3
         assert any("raju puri" in q for q in queries)
-        assert any("CIAA" in q and "raju" not in q.lower() or "raju" in q for q in queries)
+        assert any(
+            "CIAA" in q and "raju" not in q.lower() or "raju" in q for q in queries
+        )
 
     def test_generate_query_variations_adds_nepal_keyword_to_all_queries(self):
         case = self._create_case(
