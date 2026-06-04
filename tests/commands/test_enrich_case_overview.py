@@ -1426,11 +1426,7 @@ class TestErrorHandling:
                 response.status = 200
             else:
                 response.read.return_value = json.dumps(
-                    {
-                        "choices": [
-                            {"message": {"content": '{"result": "ok"}'}}
-                        ]
-                    }
+                    {"choices": [{"message": {"content": '{"result": "ok"}'}}]}
                 ).encode()
                 response.status = 200
             return response
