@@ -694,7 +694,9 @@ class Command(BaseCommand):
 
         for idx, case in enumerate(cases, 1):
             self.stdout.write(
-                f"\n[{idx}/{len(cases)}] {case.case_id} - {case.title[:80]}..."
+                self._safe_output_text(
+                    f"\n[{idx}/{len(cases)}] {case.case_id} - {case.title[:80]}..."
+                )
             )
             logger.info("[%d/%d] Processing case %s", idx, len(cases), case.case_id)
             try:
@@ -704,7 +706,11 @@ class Command(BaseCommand):
             except Exception as exc:
                 self.stats["cases_failed"] += 1
                 logger.exception("Error processing %s", case.case_id)
-                self.stdout.write(self.style.ERROR(f"FAILED: {case.case_id} - {exc}"))
+                self.stdout.write(
+                    self.style.ERROR(
+                        self._safe_output_text(f"FAILED: {case.case_id} - {exc}")
+                    )
+                )
 
         elapsed = int(time.time() - started)
         logger.info(
@@ -1191,7 +1197,7 @@ class Command(BaseCommand):
         else:
             primary = None
         if primary:
-            self.stdout.write(f"  Source: {self._describe_source(primary)}")
+            self.stdout.write(self._safe_output_text(f"  Source: {self._describe_source(primary)}"))
         self.stdout.write(
             f"  Gathered: charge_sheet={'yes' if source_texts['charge_sheet'] else 'no'}, "
             f"press_releases={len(source_texts['press_releases'])}, "
@@ -1416,7 +1422,9 @@ class Command(BaseCommand):
 
         valid, issues = self._validate_overview(short_description, description)
         for issue in issues:
-            self.stdout.write(self.style.WARNING(f"  Quality issue: {issue}"))
+            self.stdout.write(
+                self.style.WARNING(self._safe_output_text(f"  Quality issue: {issue}"))
+            )
             logger.warning(
                 "Case %s: step=validate status=issue reason=%s", case.case_id, issue
             )
@@ -1859,13 +1867,18 @@ class Command(BaseCommand):
         logger.warning("Case %s: skipped — %s", case.case_id, note)
         if not dry_run:
             self._record_missing_details(case, f"enrich_case_overview: {note}")
-        self.stdout.write(self.style.WARNING(f"  SKIPPED: {note}"))
+        self.stdout.write(self.style.WARNING(self._safe_output_text(f"  SKIPPED: {note}")))
 
     def _record_missing_details(self, case, note):
         current = case.missing_details or ""
         if note not in current:
             case.missing_details = f"{current}\n{note}" if current else note
             case.save(update_fields=["missing_details", "updated_at"])
+
+    @staticmethod
+    def _safe_output_text(text: str) -> str:
+        """Strip non-ASCII for console safety (prevents UnicodeEncodeError on cp1252)."""
+        return text.encode("ascii", errors="replace").decode("ascii")
 
     def _describe_source(self, source):
         if source.uploaded_file:
