@@ -121,13 +121,12 @@ _EVENT_LIFECYCLE_ORDER = {
 }
 
 _MAX_ARTICLES_PER_EVENT_TYPE = 1
-_QUERY_LIMIT = 15
+_QUERY_LIMIT = 12
 _QUERY_RESERVED_ENGLISH_SLOTS = 4
 _QUERY_RESERVED_EVENT_SLOTS = 4
 
 _EVENT_QUERY_TEMPLATES: dict[str, list[str]] = {
     _EVENT_INVESTIGATION: [
-        "{name} अख्तियार अनुसन्धान",
         "{name} CIAA investigation",
     ],
     _EVENT_FILING: [
@@ -141,12 +140,10 @@ _EVENT_QUERY_TEMPLATES: dict[str, list[str]] = {
     _EVENT_VERDICT: [
         "{name} फैसला विशेष अदालत",
         "{name} verdict special court corruption",
-        "{name} ठहर भ्रष्टाचार",
     ],
     _EVENT_APPEAL: [
         "{name} पुनरावेदन सर्वोच्च",
         "{name} supreme court appeal corruption",
-        "{name} अख्तियार पुनरावेदन",
         "{name} सर्वोच्च अदालत फैसला",
     ],
 }
@@ -178,6 +175,7 @@ Rules:
 - Matching on defendant name + corruption allegations is medium evidence.
 - If the article is about a different corruption case involving the same person, it is NOT relevant.
 - If the article is about the same person but not about corruption allegations, it is NOT relevant.
+- If the article excerpt appears to be mostly navigation menus, category listings, or site boilerplate with only a headline and one sentence of actual content, return relevant=false with reason "insufficient article content — likely paywalled or thin page". A real news article has multiple sentences of body text describing the event.
 - The "event_type" field is required when relevant=true. Never return an empty string. Use "other" if the article is relevant but does not clearly fit the above categories.
 """
 
@@ -322,7 +320,7 @@ def _search_duckduckgo(query: str, timeout: int = 15) -> list[dict]:
                 {"title": title_text, "url": result_url, "snippet": snippet_text}
             )
 
-    return results
+    return results[:8]
 
 
 def _extract_ddg_redirect(url: str) -> str:
@@ -631,13 +629,6 @@ def _deduplicate_queries(
             seen.add(q)
             deduped.append(q)
 
-    if case_number:
-        name_clean = (
-            re.sub(r"\s+", " ", accused_names[0]).strip() if accused_names else ""
-        )
-        if name_clean and len(name_clean) > 3:
-            deduped.append(f'"{case_number}" {name_clean}')
-
     return deduped
 
 
@@ -658,7 +649,6 @@ def _build_name_based_queries(case: Case) -> list[str]:
             if location:
                 queries.append(f'"{name_clean}" {location} भ्रष्टाचार')
                 queries.append(f"{name_clean} {location} अख्तियार")
-            queries.append(f"{name_clean} CIAA corruption")
         else:
             queries.append(f"{name_clean} CIAA corruption Nepal")
 
@@ -1177,6 +1167,15 @@ class NewsEnricher:
             stats["reason"] = "max_articles_reached"
             return [], stats
 
+        # Sort by DDG snippet length descending — longer snippets are a cheap
+        # proxy for richer article pages, improving odds that the first article
+        # verified per event type has substantial content.
+        new_candidates = sorted(
+            new_candidates,
+            key=lambda c: len(c.get("snippet", "")),
+            reverse=True,
+        )
+
         accepted = self._fetch_and_verify_candidates(
             new_candidates,
             case,
@@ -1530,7 +1529,15 @@ class NewsEnricher:
         remaining = limit - len(accepted)
         used_indices: set[int] = set()
 
-        for i, verified in enumerate(deferred):
+        # Sort deferred by article body length descending — longer articles
+        # have more detail and make better sources for timeline enrichment.
+        sorted_deferred = sorted(
+            enumerate(deferred),
+            key=lambda x: len(x[1].get("_article_text", "")),
+            reverse=True,
+        )
+
+        for i, verified in sorted_deferred:
             if remaining <= 0:
                 break
             event = verified.get("event_type", "")
@@ -1553,11 +1560,13 @@ class NewsEnricher:
                     verified["confidence"],
                 )
 
-        for i, verified in enumerate(deferred):
+        for i, verified in sorted(
+            ((i, v) for i, v in enumerate(deferred) if i not in used_indices),
+            key=lambda x: len(x[1].get("_article_text", "")),
+            reverse=True,
+        ):
             if remaining <= 0:
                 break
-            if i in used_indices:
-                continue
             event = verified.get("event_type", "")
             if event and _would_exceed_event_cap(event):
                 continue
@@ -1731,6 +1740,45 @@ Article text:
                     url[:80],
                 )
                 return None
+
+        # Detect paywall/redirect pages regardless of size: check that at least
+        # one significant word from the article title appears in the body
+        # BEYOND the first 200 chars (title is often in nav/header even on
+        # paywall pages, but real article content repeats it further down).
+        if article_title_clean and len(article_title_clean) > 10:
+            title_words = [
+                w.lower()
+                for w in re.split(r"[\s\-–—|]+", article_title_clean)
+                if len(w) >= 4
+            ][:5]
+            body_beyond_nav = article_body[200:].lower()
+            if title_words and not any(w in body_beyond_nav for w in title_words):
+                stats["rejected"] += 1
+                logger.debug(
+                    "  rejected: %s — body does not contain title keywords"
+                    " (likely paywall or redirect)",
+                    url[:80],
+                )
+                return None
+
+        # Reject pages that explicitly signal a missing/deleted article.
+        _NOT_FOUND_SIGNALS = (
+            "does not exist",
+            "page not found",
+            "article not found",
+            "content not found",
+            "no longer available",
+            "nothing was found",
+            "could not be found",
+        )
+        body_lower_nf = article_body.lower()
+        if any(sig in body_lower_nf for sig in _NOT_FOUND_SIGNALS):
+            stats["rejected"] += 1
+            logger.debug(
+                "  rejected: %s — page signals article not found (deleted/moved)",
+                url[:80],
+            )
+            return None
 
         if api_key and self.llm_base_url:
             excerpt = self._trim_excerpt(article_body)
@@ -1951,7 +1999,7 @@ Article text:
         elif dry_run and accepted:
             logger.info("  [DRY RUN] Would save %d article(s)", len(accepted))
             for a in accepted:
-                logger.info("    - %s", a["url"][:80])
+                logger.info("    - %s", a["url"])
             new_sources = len(accepted)
 
         self._log_case_article_summary(case, pre_existing, new_sources, accepted)
