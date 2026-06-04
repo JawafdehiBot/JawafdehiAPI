@@ -95,9 +95,9 @@ def _make_source(
     )
 
 
-_PRIVATE_IP_CLASS_A = "10.0.0.1"
-_PRIVATE_IP_CLASS_B = "172.16.0.1"
-_PRIVATE_IP_CLASS_C = "192.168.1.1"
+_PRIVATE_IP_CLASS_A = "10.0.0.1"  # NOSONAR
+_PRIVATE_IP_CLASS_B = "172.16.0.1"  # NOSONAR
+_PRIVATE_IP_CLASS_C = "192.168.1.1"  # NOSONAR
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
