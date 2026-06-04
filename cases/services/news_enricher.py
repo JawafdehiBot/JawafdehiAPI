@@ -543,40 +543,56 @@ def _append_event_targeted_queries(queries: list[str], case: Case) -> None:
             queries.append(template.format(name=name_clean))
 
 
-def _infer_event_type_from_reason(reason: str, fallback_event_type: str) -> str:
-    """Extract a lifecycle event type from the LLM's reason text.
+def _infer_event_type_from_reason(
+    reason: str, article_title: str, fallback_event_type: str
+) -> str:
+    """Extract a lifecycle event type from the LLM's reason text or article title.
 
     When the structured event_type field is none/empty/unknown but the
     reason text clearly describes a specific event (e.g. "the article reports
     the CIAA filing a corruption charge sheet"), infer the correct type so
     event caps are applied correctly instead of silently falling through as
     "other".
-    """
-    reason_lower = reason.lower()
 
-    # Start with the fallback that the LLM gave us (make "other" from
-    # none/empty/unknown, but still try to improve it from reason).
+    When the LLM response is truncated, the fallback parser produces a generic
+    reason like "fallback: extracted from raw response" with no keywords. In
+    that case, the article title (which often contains Nepali event signals
+    like सर्वोच्च / पुनरावेदन for appeal) is searched instead.
+    """
+    # Combined text: reason first (English-dominant), then title (Devanagari signals)
+    combined = f"{reason} {article_title}".lower()
+
+    # Start with the fallback that the LLM gave us.
     event = fallback_event_type if fallback_event_type in _LIFECYCLE_EVENT_TYPES else ""
 
     if not event:
-        # Map reason keywords to event types, checked in priority order
-        # so "appeal" doesn't match "supreme court verdict" (verdict wins
-        # by position, which is wrong — appeal should lose to verdict).
-        # Use most-specific-first ordering.
-        if re.search(r"investigat(ion|e|ing)", reason_lower):
-            event = _EVENT_INVESTIGATION
-        elif re.search(
-            r"charge.?sheet|filed|filing|filed a|charge.?sheet", reason_lower
-        ):
-            event = _EVENT_FILING
-        elif re.search(r"hearing|proceeding|bench", reason_lower):
-            event = _EVENT_HEARING
-        elif re.search(
-            r"verdict|convict|acquit|sentence|decision|found guilty", reason_lower
-        ):
-            event = _EVENT_VERDICT
-        elif re.search(r"appeal|appellate|supreme court", reason_lower):
-            event = _EVENT_APPEAL
+        # Map keywords to event types, checked in priority order.
+        # Each row has (event_type, *patterns). The first match wins.
+        _EVENT_KEYWORD_RULES = (
+            (_EVENT_INVESTIGATION, r"investigat(?:ion|e|ing)", r"अनुसन्धान"),
+            (_EVENT_FILING, r"charge.?sheet", r"filed|filing", r"मुद्दा दायर"),
+            (_EVENT_HEARING, r"hearing|proceeding|bench", r"सुनुवाइ"),
+            (
+                _EVENT_VERDICT,
+                r"verdict|convict|acquit|sentence|(?:found\s+)?guilty",
+                r"फैसला",
+                r"ठहर",
+            ),
+            (
+                _EVENT_APPEAL,
+                r"appeal|appellate|supreme court",
+                r"पुनरावेदन",
+                r"सर्वोच्च",
+                r"सर्वोच्च अदालत",
+            ),
+        )
+        for event_type, *patterns in _EVENT_KEYWORD_RULES:
+            for pat in patterns:
+                if re.search(pat, combined):
+                    event = event_type
+                    break
+            if event:
+                break
 
     return event
 
@@ -1634,7 +1650,9 @@ class NewsEnricher:
             "none",
             "unknown",
         }:
-            inferred = _infer_event_type_from_reason(reason, event_type or "")
+            inferred = _infer_event_type_from_reason(
+                reason, article_title, event_type or ""
+            )
             event_type = inferred if inferred else "other"
 
         if not is_relevant:
