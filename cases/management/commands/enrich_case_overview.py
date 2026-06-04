@@ -90,7 +90,7 @@ from typing import Any
 from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
 
-from cases.models import Case, CaseState, DocumentSource, SourceType
+from cases.models import Case, CaseState, CaseType, DocumentSource, SourceType
 from cases.services.priority_case_loader import filter_by_priority, load_priority_cases
 
 logger = logging.getLogger(__name__)
@@ -573,6 +573,7 @@ class Command(BaseCommand):
             "llm_extraction_failures": 0,
             "llm_formatting_failures": 0,
         }
+        self._markitdown = None
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -720,7 +721,9 @@ class Command(BaseCommand):
         )
 
     def _get_eligible_cases(self, limit, force, case_id, priority=False):
-        queryset = Case.objects.filter(state=CaseState.DRAFT)
+        queryset = Case.objects.filter(
+            state=CaseState.DRAFT, case_type=CaseType.CORRUPTION
+        )
         if case_id:
             queryset = queryset.filter(case_id=case_id)
         if priority:
@@ -1094,11 +1097,6 @@ class Command(BaseCommand):
             # Use icontains for substring matching against the normalized case
             # number (e.g. "080-CR-0007" appearing anywhere in the title).
             q = Q(title__icontains=case_num)
-            if case_num and len(case_num) >= 8:
-                # Also try matching just the last part (e.g. "0007" from "080-CR-0007")
-                parts = case_num.split("-")
-                if len(parts) >= 3 and parts[-1].isdigit():
-                    q |= Q(title__icontains=parts[-1])
             sources = DocumentSource.objects.filter(
                 q,
                 source_type=SourceType.LEGAL_COURT_ORDER,
@@ -1336,7 +1334,7 @@ class Command(BaseCommand):
                     new_entries.append(entry)
             if new_entries and not dry_run:
                 case.court_cases = (case.court_cases or []) + new_entries
-                case.save(update_fields=["court_cases"])
+                case.save(update_fields=["court_cases", "updated_at"])
                 logger.info(
                     "Case %s: backfilled court_cases with %d new entries: %s",
                     case.case_id,
@@ -1622,10 +1620,11 @@ class Command(BaseCommand):
                     response_model,
                     model,
                 )
-                assert response_model == model or normalize_model(response_model) == model, (
-                    f"Model mismatch: sent {model!r} but "
-                    f"response from {response_model!r}"
-                )
+                if response_model != model and normalize_model(response_model) != model:
+                    raise ValueError(
+                        f"Model mismatch: sent {model!r} but "
+                        f"response from {response_model!r}"
+                    )
                 return _extract_json_body(raw)
             except Exception as exc:
                 logger.warning(
@@ -1645,14 +1644,19 @@ class Command(BaseCommand):
 
     # ── Source conversion ──────────────────────────────────────────
 
+    def _get_markitdown(self):
+        if self._markitdown is None:
+            try:
+                from markitdown import MarkItDown
+            except ImportError as exc:
+                raise CommandError(
+                    "markitdown is required for case overview enrichment"
+                ) from exc
+            self._markitdown = MarkItDown(enable_plugins=True)
+        return self._markitdown
+
     def _convert_source_to_markdown(self, source):
-        try:
-            from markitdown import MarkItDown
-        except ImportError as exc:
-            raise CommandError(
-                "markitdown is required for case overview enrichment"
-            ) from exc
-        converter = MarkItDown(enable_plugins=True)
+        converter = self._get_markitdown()
         with tempfile.TemporaryDirectory(prefix="overview-enrichment-") as tmp_dir:
             output_dir = Path(tmp_dir)
             # Try uploaded files first
@@ -1858,7 +1862,7 @@ class Command(BaseCommand):
         current = case.missing_details or ""
         if note not in current:
             case.missing_details = f"{current}\n{note}" if current else note
-            case.save(update_fields=["missing_details"])
+            case.save(update_fields=["missing_details", "updated_at"])
 
     def _describe_source(self, source):
         if source.uploaded_file:
