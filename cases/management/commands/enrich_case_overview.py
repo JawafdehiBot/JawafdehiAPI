@@ -538,7 +538,10 @@ def _extract_json_body(raw: str) -> str:
 
 def _parse_llm_opencode_response(payload: dict) -> str:
     """Extract response text from a non-streaming completion payload."""
-    return payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+    choices = payload.get("choices", [])
+    if not choices:
+        return ""
+    return choices[0].get("message", {}).get("content", "")
 
 
 def _parse_llm_response_json(raw_text: str) -> dict:
