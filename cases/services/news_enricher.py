@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 _MAX_HTML_REGEX_LENGTH = 500_000
 
+_DEFAULT_LLM_MODEL = "gpt-4.5"
+_DEFAULT_LLM_BASE_URL = "https://llm-proxy.jawafdehi.org/v1"
+
 _HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; JawafdehiAPI/1.0)",
 }
@@ -109,6 +112,9 @@ _EVENT_LIFECYCLE_ORDER = {
 }
 
 _MAX_ARTICLES_PER_EVENT_TYPE = 1
+_QUERY_LIMIT = 15
+_QUERY_RESERVED_ENGLISH_SLOTS = 4
+_QUERY_RESERVED_EVENT_SLOTS = 4
 
 _EVENT_QUERY_TEMPLATES: dict[str, list[str]] = {
     _EVENT_INVESTIGATION: [
@@ -215,7 +221,7 @@ def _extract_text_from_html(html: str) -> str:
     try:
         parser.feed(html)
     except Exception:
-        pass
+        logger.exception("HTML parse error in _extract_text_from_html")
     text = " ".join(parser.text_parts)
     text = re.sub(r"\s+", " ", text).strip()
     return _fix_mojibake(text)
@@ -238,35 +244,36 @@ def _search_duckduckgo(query: str, timeout: int = 15) -> list[dict]:
     Returns list of dicts with keys: title, url, snippet.
     """
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-    backoff_delays = (5, 15, 45)
-    for attempt, delay in enumerate(backoff_delays, 1):
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
             if resp.status_code in (403, 429):
+                if attempt < max_attempts:
+                    delay = 5 * 3 ** (attempt - 1)
+                    logger.warning(
+                        "DDG search attempt %d/%d: HTTP %d for '%s' — retrying in %ds",
+                        attempt,
+                        max_attempts,
+                        resp.status_code,
+                        query[:60],
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
                 logger.warning(
-                    "DDG search attempt %d/%d: HTTP %d for '%s' — retrying in %ds",
-                    attempt,
-                    len(backoff_delays),
-                    resp.status_code,
+                    "DDG search failed after %d attempts for '%s'",
+                    max_attempts,
                     query[:60],
-                    delay,
                 )
-                time.sleep(delay)
-                continue
+                return []
             resp.raise_for_status()
         except requests.RequestException as exc:
             logger.warning(
                 "DuckDuckGo search failed for query '%s': %s", query[:60], exc
             )
             return []
-        break  # success → exit loop, skip else
-    else:
-        logger.warning(
-            "DuckDuckGo search failed after %d attempts for '%s'",
-            len(backoff_delays),
-            query[:60],
-        )
-        return []
+        break  # success → exit loop
 
     html = _truncate_for_regex(resp.text)
     results = []
@@ -352,9 +359,9 @@ def _generate_query_variations(
     deduped_events = _deduplicate_queries(event_queries, case_number, accused_names)
     deduped_general = _deduplicate_queries(general_queries, case_number, accused_names)
 
-    reserved_english_slots = min(4, len(deduped_english))
-    reserved_event_slots = min(4, len(deduped_events))
-    general_slots = 15 - reserved_english_slots - reserved_event_slots
+    reserved_english_slots = min(_QUERY_RESERVED_ENGLISH_SLOTS, len(deduped_english))
+    reserved_event_slots = min(_QUERY_RESERVED_EVENT_SLOTS, len(deduped_events))
+    general_slots = _QUERY_LIMIT - reserved_english_slots - reserved_event_slots
 
     combined = (
         deduped_english[:reserved_english_slots]
@@ -365,7 +372,7 @@ def _generate_query_variations(
     )
     return _normalize_search_queries(
         _deduplicate_queries(combined, case_number, accused_names)
-    )[:15]
+    )[:_QUERY_LIMIT]
 
 
 _DEVANAGARI_RE = re.compile(r"[ऀ-ॿ]")
@@ -541,32 +548,6 @@ def _detect_case_events(case: Case) -> list[str]:
     ]
 
 
-def _fetch_ngm_hearing_data(case: Case) -> Optional[dict]:
-    """Fetch NGM hearing data for a case. Returns None on any failure."""
-    court_case_numbers = []
-    if case.court_cases:
-        for cc in case.court_cases:
-            if isinstance(cc, str) and ":" in cc:
-                court_case_numbers.append(cc)
-    if not court_case_numbers:
-        return None
-
-    try:
-        from ngm.services import get_court_case_details
-    except ImportError:
-        return None
-
-    for cc_str in court_case_numbers:
-        court_id, case_num = cc_str.split(":", 1)
-        try:
-            details = get_court_case_details(court_id.strip(), case_num.strip())
-            if details:
-                return details
-        except (ValueError, Exception):
-            continue
-    return None
-
-
 def _deduplicate_queries(
     queries: list[str], case_number: Optional[str], accused_names: list[str]
 ) -> list[str]:
@@ -686,7 +667,10 @@ def _get_accused_names(case: Case) -> list[str]:
             if name_clean:
                 names.append(name_clean)
     except Exception:
-        pass
+        logger.exception(
+            "Failed to load accused entity relationships for case %s", case.case_id
+        )
+        close_old_connections()
 
     if names:
         return names[:5]
@@ -955,7 +939,7 @@ class NewsEnricher:
 
     def __init__(
         self,
-        llm_model: str = "gpt-4.5",
+        llm_model: str = _DEFAULT_LLM_MODEL,
         llm_base_url: Optional[str] = None,
         llm_api_key: Optional[str] = None,
         max_articles_per_case: int = 5,
@@ -963,9 +947,9 @@ class NewsEnricher:
         fetch_delay: float = 0.5,
         verbose: bool = False,
     ):
-        self.llm_model = llm_model
+        self.llm_model = llm_model or _DEFAULT_LLM_MODEL
         self.llm_base_url = llm_base_url or os.environ.get(
-            "JAWAFDEHI_LLM_PROXY_URL", "https://llm-proxy.jawafdehi.org/v1"
+            "JAWAFDEHI_LLM_PROXY_URL", _DEFAULT_LLM_BASE_URL
         )
         self.llm_api_key = llm_api_key
         self.max_articles_per_case = max_articles_per_case
@@ -1461,8 +1445,9 @@ class NewsEnricher:
     ) -> None:
         """Fill remaining accepted slots from deferred candidates."""
         remaining = limit - len(accepted)
+        used_indices: set[int] = set()
 
-        for verified in deferred:
+        for i, verified in enumerate(deferred):
             if remaining <= 0:
                 break
             event = verified.get("event_type", "")
@@ -1476,6 +1461,7 @@ class NewsEnricher:
                 event_type_counts[event] = event_type_counts.get(event, 0) + 1
                 stats["accepted"] += 1
                 remaining -= 1
+                used_indices.add(i)
                 logger.info(
                     "  Accepted (deferred): %s (event: %s, confidence: %s)",
                     verified["url"][:80],
@@ -1483,9 +1469,11 @@ class NewsEnricher:
                     verified["confidence"],
                 )
 
-        for verified in deferred:
+        for i, verified in enumerate(deferred):
             if remaining <= 0:
                 break
+            if i in used_indices:
+                continue
             event = verified.get("event_type", "")
             if event and _would_exceed_event_cap(event):
                 continue
@@ -2478,8 +2466,11 @@ def enrich_cases_batch(
         "cases_no_articles": 0,
     }
 
-    cases_list = list(cases)
-    total = len(cases_list)
+    total = 0
+    cases_list = []
+    for c in cases:
+        cases_list.append(c)
+        total += 1
 
     for idx, case in enumerate(cases_list, 1):
         close_old_connections()

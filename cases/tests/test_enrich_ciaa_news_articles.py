@@ -350,17 +350,21 @@ class TestNewsEnricherService:
         assert stats["searched"] == 3
         assert len(results) == 2
 
-    def test_detect_case_events_always_returns_filing_investigation(self):
+    def test_detect_case_events_always_returns_all_event_types(self):
         case = self._create_case(
             case_start_date=None,
             case_end_date=None,
             court_cases=[],
         )
         events = _detect_case_events(case)
-        assert _EVENT_FILING in events
         assert _EVENT_INVESTIGATION in events
+        assert _EVENT_FILING in events
+        assert _EVENT_HEARING in events
+        assert _EVENT_VERDICT in events
+        assert _EVENT_APPEAL in events
+        assert len(events) == 5
 
-    def test_detect_case_events_with_start_date_adds_hearing(self):
+    def test_detect_case_events_with_start_date_also_returns_all(self):
         case = self._create_case(
             case_start_date=date(2023, 7, 1),
             case_end_date=None,
@@ -368,14 +372,14 @@ class TestNewsEnricherService:
         )
         events = _detect_case_events(case)
         assert _EVENT_HEARING in events
-        assert _EVENT_VERDICT not in events
-        assert _EVENT_APPEAL not in events
+        assert _EVENT_VERDICT in events
+        assert _EVENT_APPEAL in events
 
-    def test_detect_case_events_with_end_date_adds_verdict_appeal(self):
+    def test_detect_case_events_with_end_date_also_returns_all(self):
         case = self._create_case(
             case_start_date=date(2023, 7, 1),
             case_end_date=date(2024, 6, 12),
-            court_cases=[],  # no supreme: entry — should still get appeal
+            court_cases=[],
         )
         events = _detect_case_events(case)
         assert _EVENT_VERDICT in events

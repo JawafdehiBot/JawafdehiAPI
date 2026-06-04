@@ -19,7 +19,12 @@ import os
 from django.core.management.base import BaseCommand
 
 from cases.models import Case, CaseState, CaseType
-from cases.services.news_enricher import NewsEnricher, enrich_cases_batch
+from cases.services.news_enricher import (
+    _DEFAULT_LLM_BASE_URL,
+    _DEFAULT_LLM_MODEL,
+    NewsEnricher,
+    enrich_cases_batch,
+)
 from cases.services.priority_case_loader import filter_by_priority, load_priority_cases
 
 logger = logging.getLogger(__name__)
@@ -114,7 +119,7 @@ class Command(BaseCommand):
             val = options.get(name)
             if val is not None and val < 0:
                 return f"--{name} must be a non-negative integer"
-        search_delay = options.get("search_delay", 2.0)
+        search_delay = options.get("search_delay", 1.5)
         fetch_delay = options.get("fetch_delay", 0.5)
         if search_delay < 0 or fetch_delay < 0:
             return "--search-delay and --fetch-delay must be non-negative"
@@ -123,10 +128,10 @@ class Command(BaseCommand):
     def _resolve_llm_config(self, options):
         """Resolve LLM model, base URL, and API key from options and environment."""
         model = options.get("llm_model") or os.environ.get(
-            "JAWAFDEHI_LLM_MODEL", "gpt-4.5"
+            "JAWAFDEHI_LLM_MODEL", _DEFAULT_LLM_MODEL
         )
         base_url = options.get("llm_base_url") or os.environ.get(
-            "JAWAFDEHI_LLM_PROXY_URL", "https://llm-proxy.jawafdehi.org/v1"
+            "JAWAFDEHI_LLM_PROXY_URL", _DEFAULT_LLM_BASE_URL
         )
         api_key = (
             options.get("llm_api_key")
@@ -231,10 +236,9 @@ class Command(BaseCommand):
 
         cases = self._build_case_queryset(case_id, priority, all_cases_flag)
 
+        total = cases.count()
         if limit is not None:
             cases = cases[:limit]
-
-        total = cases.count()
         if total == 0:
             self.stdout.write("No cases to process")
             self._print_summary({}, dry_run)
@@ -250,7 +254,7 @@ class Command(BaseCommand):
             llm_base_url=base_url,
             llm_api_key=api_key,
             max_articles_per_case=max_articles,
-            search_delay=options.get("search_delay", 2.0),
+            search_delay=options.get("search_delay", 1.5),
             fetch_delay=options.get("fetch_delay", 0.5),
             verbose=verbose,
         )
