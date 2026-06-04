@@ -200,7 +200,7 @@ class _TextExtractor(HTMLParser):
         super().__init__()
         self.text_parts = []
         self._skip = False
-        self._skip_tags = {"script", "style", "noscript", "nav", "footer", "header"}
+        self._skip_tags = {"script", "style", "noscript", "nav", "footer"}
 
     def handle_starttag(self, tag, attrs):
         if tag.lower() in self._skip_tags:
