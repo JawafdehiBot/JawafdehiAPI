@@ -1636,7 +1636,9 @@ class NewsEnricher:
         return results
 
     @staticmethod
-    def _trim_excerpt(text: str, max_chars: int = 1500, devanagari_max: int = 1000) -> str:
+    def _trim_excerpt(
+        text: str, max_chars: int = 1500, devanagari_max: int = 1000
+    ) -> str:
         """Trim article excerpt with Devanagari-aware limit.
 
         Devanagari is multi-byte in UTF-8 and tokenizes denser than English.

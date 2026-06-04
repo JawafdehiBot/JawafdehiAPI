@@ -92,14 +92,32 @@ class TestNewsEnricherService:
         mock_response.text = outer_payload
         return mock_response
 
-    def _mock_dual_llm_post(self, relevant=True, confidence="high", reason="Match",
-                            event_type="filing", summary_text="Nepali summary."):
+    def _mock_dual_llm_post(
+        self,
+        relevant=True,
+        confidence="high",
+        reason="Match",
+        event_type="filing",
+        summary_text="Nepali summary.",
+    ):
         """Return a side_effect function that routes requests.post to verify vs summary LLM."""
-        verify_inner = {"relevant": relevant, "confidence": confidence, "reason": reason}
+        verify_inner = {
+            "relevant": relevant,
+            "confidence": confidence,
+            "reason": reason,
+        }
         if relevant:
             verify_inner["event_type"] = event_type
-        verify_payload = json.dumps({"choices": [{"message": {"content": json.dumps(verify_inner)}}]})
-        summ_payload = json.dumps({"choices": [{"message": {"content": json.dumps({"summary": summary_text})}}]})
+        verify_payload = json.dumps(
+            {"choices": [{"message": {"content": json.dumps(verify_inner)}}]}
+        )
+        summ_payload = json.dumps(
+            {
+                "choices": [
+                    {"message": {"content": json.dumps({"summary": summary_text})}}
+                ]
+            }
+        )
 
         def _route(*args, **kwargs):
             content = ""
@@ -118,6 +136,7 @@ class TestNewsEnricherService:
                 r.text = verify_payload
                 r.json.return_value = json.loads(verify_payload)
             return r
+
         return _route
 
     def _get_sample_html(self, title="Test Article", body=None):
@@ -558,7 +577,14 @@ class TestNewsEnricherService:
         ), patch(
             "requests.post",
         ) as mock_post:
-            verify = json.dumps({"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"})
+            verify = json.dumps(
+                {
+                    "relevant": True,
+                    "confidence": "high",
+                    "reason": "Match",
+                    "event_type": "filing",
+                }
+            )
             summ = json.dumps({"summary": "Dup evidence summary."})
 
             def _dup_side(*a, **kw):
@@ -578,6 +604,7 @@ class TestNewsEnricherService:
                     r.text = verify
                     r.json.return_value = json.loads(verify)
                 return r
+
             mock_post.side_effect = _dup_side
 
             enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
@@ -657,7 +684,14 @@ class TestNewsEnricherService:
         ), patch(
             "requests.post",
         ) as mock_post:
-            verify = json.dumps({"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"})
+            verify = json.dumps(
+                {
+                    "relevant": True,
+                    "confidence": "high",
+                    "reason": "Match",
+                    "event_type": "filing",
+                }
+            )
             summ = json.dumps({"summary": "Search error test summary."})
 
             def _search_err_side(*a, **kw):
@@ -677,6 +711,7 @@ class TestNewsEnricherService:
                     r.text = verify
                     r.json.return_value = json.loads(verify)
                 return r
+
             mock_post.side_effect = _search_err_side
 
             stats = enricher.enrich_case(case, dry_run=False, case_num=1, total_cases=1)
@@ -737,7 +772,14 @@ class TestNewsEnricherService:
             mock_fetch.return_value = self._get_sample_html()
 
             with patch("requests.post") as mock_post:
-                verify = json.dumps({"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"})
+                verify = json.dumps(
+                    {
+                        "relevant": True,
+                        "confidence": "high",
+                        "reason": "Match",
+                        "event_type": "filing",
+                    }
+                )
                 summ = json.dumps({"summary": "Linked article summary."})
 
                 def _link_side(*a, **kw):
@@ -757,6 +799,7 @@ class TestNewsEnricherService:
                         r.text = verify
                         r.json.return_value = json.loads(verify)
                     return r
+
                 mock_post.side_effect = _link_side
                 stats = enricher.enrich_case(
                     case, dry_run=False, case_num=1, total_cases=1
@@ -922,7 +965,12 @@ class TestEnrichCiaaNewsArticlesCommand:
             "requests.post",
         ) as mock_post:
             verify_inner = json.dumps(
-                {"relevant": True, "confidence": "high", "reason": "Match", "event_type": "filing"}
+                {
+                    "relevant": True,
+                    "confidence": "high",
+                    "reason": "Match",
+                    "event_type": "filing",
+                }
             )
             summary_inner = json.dumps({"summary": "नागरिकले मुद्दाको सारांश।"})
             verify_payload = json.dumps(
@@ -949,6 +997,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                     resp.text = verify_payload
                     resp.json.return_value = json.loads(verify_payload)
                 return resp
+
             mock_post.side_effect = _mock_llm_for_test
 
             out = StringIO()
@@ -984,7 +1033,15 @@ class TestEnrichCiaaNewsArticlesCommand:
             "requests.post",
         ) as mock_post:
             verify_payload = json.dumps(
-                {"choices": [{"message": {"content": '{"relevant": false, "reason": "No match"}'}}]}
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"relevant": false, "reason": "No match"}'
+                            }
+                        }
+                    ]
+                }
             )
             summ_payload = json.dumps(
                 {"choices": [{"message": {"content": '{"summary": ""}'}}]}
@@ -1007,6 +1064,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                     r.text = verify_payload
                     r.json.return_value = json.loads(verify_payload)
                 return r
+
             mock_post.side_effect = _case_side
 
             out = StringIO()
@@ -1078,7 +1136,11 @@ class TestEnrichCiaaNewsArticlesCommand:
             "requests.post",
         ) as mock_post:
             verify_payload = json.dumps(
-                {"choices": [{"message": {"content": '{"relevant": false, "reason": "No"}'}}]}
+                {
+                    "choices": [
+                        {"message": {"content": '{"relevant": false, "reason": "No"}'}}
+                    ]
+                }
             )
             summ_payload = json.dumps(
                 {"choices": [{"message": {"content": '{"summary": ""}'}}]}
@@ -1101,6 +1163,7 @@ class TestEnrichCiaaNewsArticlesCommand:
                     r.text = verify_payload
                     r.json.return_value = json.loads(verify_payload)
                 return r
+
             mock_post.side_effect = _limit_side
 
             out = StringIO()
