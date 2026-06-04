@@ -1715,6 +1715,21 @@ Article text:
             logger.debug("  rejected: %s — could not fetch article content", url[:80])
             return None
 
+        # Reject short English boilerplate (paywall splash pages, cookie walls, etc.)
+        # that contains no Devanagari and no case-relevant keywords.
+        _PAYWALL_KEYWORDS = frozenset(
+            {"ciaa", "corruption", "akhtiyar", "अख्तियार", "भ्रष्टाचार"}
+        )
+        if len(article_body) < 500 and not _DEVANAGARI_RE.search(article_body):
+            body_lower = article_body.lower()
+            if not any(kw in body_lower for kw in _PAYWALL_KEYWORDS):
+                stats["rejected"] += 1
+                logger.debug(
+                    "  rejected: %s — insufficient content (short English, no case keywords)",
+                    url[:80],
+                )
+                return None
+
         if api_key and self.llm_base_url:
             excerpt = self._trim_excerpt(article_body)
             is_relevant, confidence, reason, event_type = (

@@ -122,7 +122,7 @@ class TestNewsEnricherService:
 
     def _get_sample_html(self, title="Test Article", body=None):
         if body is None:
-            body = "This is a test article body with enough text. " * 5
+            body = "CIAA corruption investigation body text for test article. " * 25
         return f"""<!DOCTYPE html>
 <html>
 <head><title>{title}</title>
@@ -627,7 +627,7 @@ class TestNewsEnricherService:
 
         html_without_date = (
             "<html><head><title>No Date Article</title></head><body><p>"
-            + "Article body content. " * 20
+            + "CIAA corruption investigation article body for testing. " * 100
             + "</p></body></html>"
         )
         search_results = [
