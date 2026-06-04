@@ -1344,15 +1344,9 @@ class TestErrorHandling:
             response = MagicMock()
             response.__enter__ = MagicMock(return_value=response)
             response.__exit__ = MagicMock(return_value=False)
-            response.__iter__ = MagicMock(
-                return_value=iter(
-                    [
-                        json.dumps(
-                            {"choices": [{"message": {"content": '{"result": "ok"}'}}]}
-                        ).encode()
-                    ]
-                )
-            )
+            response.read.return_value = json.dumps(
+                {"choices": [{"message": {"content": '{"result": "ok"}'}}]}
+            ).encode()
             response.status = 200
             return response
 
@@ -1428,24 +1422,16 @@ class TestErrorHandling:
             response.__enter__ = MagicMock(return_value=response)
             response.__exit__ = MagicMock(return_value=False)
             if call_count[0] < 2:
-                response.__iter__ = MagicMock(
-                    return_value=iter([json.dumps({"choices": []}).encode()])
-                )
+                response.read.return_value = json.dumps({"choices": []}).encode()
                 response.status = 200
             else:
-                response.__iter__ = MagicMock(
-                    return_value=iter(
-                        [
-                            json.dumps(
-                                {
-                                    "choices": [
-                                        {"message": {"content": '{"result": "ok"}'}}
-                                    ]
-                                }
-                            ).encode()
+                response.read.return_value = json.dumps(
+                    {
+                        "choices": [
+                            {"message": {"content": '{"result": "ok"}'}}
                         ]
-                    )
-                )
+                    }
+                ).encode()
                 response.status = 200
             return response
 
