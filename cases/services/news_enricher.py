@@ -102,6 +102,15 @@ _ALL_EVENT_TYPES = (
 )
 
 _EVENT_OTHER = "other"
+_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        _EVENT_INVESTIGATION,
+        _EVENT_FILING,
+        _EVENT_HEARING,
+        _EVENT_VERDICT,
+        _EVENT_APPEAL,
+    }
+)
 _EVENT_LIFECYCLE_ORDER = {
     _EVENT_INVESTIGATION: 1,
     _EVENT_FILING: 2,
@@ -532,6 +541,44 @@ def _append_event_targeted_queries(queries: list[str], case: Case) -> None:
         templates = _EVENT_QUERY_TEMPLATES.get(event_type, [])
         for template in templates:
             queries.append(template.format(name=name_clean))
+
+
+def _infer_event_type_from_reason(reason: str, fallback_event_type: str) -> str:
+    """Extract a lifecycle event type from the LLM's reason text.
+
+    When the structured event_type field is none/empty/unknown but the
+    reason text clearly describes a specific event (e.g. "the article reports
+    the CIAA filing a corruption charge sheet"), infer the correct type so
+    event caps are applied correctly instead of silently falling through as
+    "other".
+    """
+    reason_lower = reason.lower()
+
+    # Start with the fallback that the LLM gave us (make "other" from
+    # none/empty/unknown, but still try to improve it from reason).
+    event = fallback_event_type if fallback_event_type in _LIFECYCLE_EVENT_TYPES else ""
+
+    if not event:
+        # Map reason keywords to event types, checked in priority order
+        # so "appeal" doesn't match "supreme court verdict" (verdict wins
+        # by position, which is wrong — appeal should lose to verdict).
+        # Use most-specific-first ordering.
+        if re.search(r"investigat(ion|e|ing)", reason_lower):
+            event = _EVENT_INVESTIGATION
+        elif re.search(
+            r"charge.?sheet|filed|filing|filed a|charge.?sheet", reason_lower
+        ):
+            event = _EVENT_FILING
+        elif re.search(r"hearing|proceeding|bench", reason_lower):
+            event = _EVENT_HEARING
+        elif re.search(
+            r"verdict|convict|acquit|sentence|decision|found guilty", reason_lower
+        ):
+            event = _EVENT_VERDICT
+        elif re.search(r"appeal|appellate|supreme court", reason_lower):
+            event = _EVENT_APPEAL
+
+    return event
 
 
 def _detect_case_events(case: Case) -> list[str]:
@@ -1587,7 +1634,8 @@ class NewsEnricher:
             "none",
             "unknown",
         }:
-            event_type = "other"
+            inferred = _infer_event_type_from_reason(reason, event_type or "")
+            event_type = inferred if inferred else "other"
 
         if not is_relevant:
             stats["rejected"] += 1
