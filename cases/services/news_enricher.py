@@ -1947,7 +1947,7 @@ Key Allegations: {', '.join(case.key_allegations[:5]) if case.key_allegations el
             case_context += f"""
 
 Press Release Text (official CIAA document):
-{press_release_text[:700]}"""
+{press_release_text[:1200]}"""
         else:
             case_context += """
 
