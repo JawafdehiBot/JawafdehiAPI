@@ -27,6 +27,7 @@ from django.core.management import CommandError, call_command
 
 from cases.management.commands.enrich_case_overview import (
     _CLOUD_METADATA_IP,
+    CHUNK_SIZE,
     Command,
     _confined_output_path,
     _copy_stream_to_path_with_limit,
@@ -41,6 +42,7 @@ from cases.management.commands.enrich_case_overview import (
     _sanitize_download_filename,
     _source_url_priority,
     _validate_host_safety,
+    chunk_document_text,
     normalize_base_url,
     normalize_model,
 )
@@ -102,6 +104,135 @@ _PRIVATE_IP_CLASS_C = "192.168.1.1"  # NOSONAR
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Group Z: Map-Reduce Utility Tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestChunkDocumentText:
+    def test_short_text_returns_single_chunk(self):
+        text = "Short text"
+        result = chunk_document_text(text, chunk_size=100, overlap=10)
+        assert result == [text]
+
+    def test_empty_text_returns_empty_list(self):
+        assert chunk_document_text("") == []
+        assert chunk_document_text(None) == []  # type: ignore[arg-type]
+
+    def test_splits_long_text(self):
+        text = "X" * 500
+        result = chunk_document_text(text, chunk_size=200, overlap=20)
+        assert len(result) >= 2
+        # Each chunk (except last) == chunk_size
+        assert len(result[0]) == 200
+
+    def test_overlap_preserves_boundary_context(self):
+        text = "FirstChunkUnique" + "A" * 200 + "SecondChunkUnique"
+        result = chunk_document_text(text, chunk_size=100, overlap=20)
+        # Join all chunks and verify content preservation
+        assert "FirstChunkUnique" in result[0]
+        assert "SecondChunkUnique" in result[-1]
+        # Verify overlap: second chunk starts before 100
+        assert result[1].startswith("A" * 20)  # overlapping chars
+
+    def test_exact_chunk_size_single_chunk(self):
+        text = "X" * 15000
+        result = chunk_document_text(text, chunk_size=CHUNK_SIZE, overlap=1000)
+        assert len(result) == 1
+
+    def test_just_over_chunk_size_creates_two_chunks(self):
+        text = "X" * (CHUNK_SIZE + 1)
+        result = chunk_document_text(text, chunk_size=CHUNK_SIZE, overlap=1000)
+        assert len(result) == 2
+        assert len(result[0]) == CHUNK_SIZE
+
+
+class TestMergeChunkExtractions:
+    def test_empty_chunks_returns_empty_structure(self):
+        cmd = Command()
+        result = cmd._merge_chunk_extractions([])
+        assert result == {
+            "accused_persons": [],
+            "case_metadata": {},
+            "fiscal_analysis": [],
+            "legal_provisions": [],
+            "key_events": [],
+            "total_disputed_amount": None,
+            "extraction_quality_notes": None,
+        }
+
+    def test_dedup_accused_by_name(self):
+        cmd = Command()
+        chunks = [
+            {"accused_persons": [{"name": "Ram Sharma", "position": "Secretary"}]},
+            {"accused_persons": [{"name": "Ram Sharma", "position": "Secretary"}]},
+            {"accused_persons": [{"name": "Shyam Thapa", "position": "Director"}]},
+        ]
+        result = cmd._merge_chunk_extractions(chunks)
+        assert len(result["accused_persons"]) == 2
+
+    def test_dedup_fiscal_by_year(self):
+        cmd = Command()
+        chunks = [
+            {"fiscal_analysis": [{"fiscal_year": "2079-80", "income": "1,00,000"}]},
+            {"fiscal_analysis": [{"fiscal_year": "2079-80", "income": "1,00,000"}]},
+        ]
+        result = cmd._merge_chunk_extractions(chunks)
+        assert len(result["fiscal_analysis"]) == 1
+
+    def test_dedup_legal_by_section(self):
+        cmd = Command()
+        chunks = [
+            {"legal_provisions": [{"act": "Act A", "section": "दफा ३"}]},
+            {"legal_provisions": [{"act": "Act A", "section": "दफा ३"}]},
+        ]
+        result = cmd._merge_chunk_extractions(chunks)
+        assert len(result["legal_provisions"]) == 1
+
+    def test_dedup_events_by_date_and_description(self):
+        cmd = Command()
+        chunks = [
+            {"key_events": [{"date": "२०८१/०३/०९", "description": "Verdict"}]},
+            {"key_events": [{"date": "२०८१/०३/०९", "description": "Verdict"}]},
+        ]
+        result = cmd._merge_chunk_extractions(chunks)
+        assert len(result["key_events"]) == 1
+
+    def test_merges_quality_notes(self):
+        cmd = Command()
+        chunks = [
+            {"extraction_quality_notes": "Section 1 garbled"},
+            {"extraction_quality_notes": "Section 2 unclear"},
+        ]
+        result = cmd._merge_chunk_extractions(chunks)
+        assert "Section 1 garbled" in result["extraction_quality_notes"]
+        assert "Section 2 unclear" in result["extraction_quality_notes"]
+
+    def test_conflicting_metadata_first_wins(self):
+        cmd = Command()
+        chunks = [
+            {"case_metadata": {"case_number": "081-CR-0001", "court": "Special Court"}},
+            {"case_metadata": {"case_number": "081-CR-9999", "court": "Supreme Court"}},
+        ]
+        result = cmd._merge_chunk_extractions(chunks)
+        assert result["case_metadata"]["case_number"] == "081-CR-0001"
+        assert result["case_metadata"]["court"] == "Special Court"
+
+    def test_handles_non_dict_chunks(self):
+        cmd = Command()
+        result = cmd._merge_chunk_extractions([None, "not a dict", 42])
+        assert result["accused_persons"] == []
+
+    def test_total_disputed_amount_first_non_null(self):
+        cmd = Command()
+        chunks = [
+            {"total_disputed_amount": None},
+            {"total_disputed_amount": "रु. १,००,०००/-"},
+        ]
+        result = cmd._merge_chunk_extractions(chunks)
+        assert result["total_disputed_amount"] == "रु. १,००,०००/-"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Group G: Source Safety & URL Handling
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -127,7 +258,9 @@ class TestValidateHostSafety:
                 _validate_host_safety(host)
 
     def test_allows_public_host(self):
-        patched_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        patched_addrinfo = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ]
         with patch("socket.getaddrinfo", return_value=patched_addrinfo):
             _validate_host_safety("example.com")
             _validate_host_safety("ciaa.gov.np")
@@ -537,7 +670,8 @@ class TestConvertSourcesToTexts:
         assert texts["investigative_reports"] == []
         assert texts["financial_docs"] == []
 
-    def test_truncates_press_releases_to_5k(self):
+    def test_press_releases_return_full_text(self):
+        """Truncation removed — press releases are no longer capped in _convert_sources_to_texts."""
         cmd = Command()
         source = _make_source("src-pr-001", "PR", SourceType.OFFICIAL_GOVERNMENT)
         long_text = "X" * 10000
@@ -551,20 +685,14 @@ class TestConvertSourcesToTexts:
                     "financial_docs": [],
                 }
             )
-        assert len(texts["press_releases"][0]) == 5000
+        assert len(texts["press_releases"][0]) == 10000  # full text, not truncated
 
-    def test_head_tail_for_long_court_orders(self):
-        from cases.management.commands.enrich_case_overview import (
-            COURT_ORDER_FULL_MAX,
-            COURT_ORDER_HEAD_CHARS,
-            COURT_ORDER_TAIL_CHARS,
-        )
-
+    def test_court_orders_return_full_text(self):
+        """Truncation removed — court orders no longer head+tail truncated."""
         cmd = Command()
         source = _make_source("src-co-001", "CO", SourceType.LEGAL_COURT_ORDER)
-        # Shorter than COURT_ORDER_FULL_MAX → full text preserved
-        short_text = "X" * 10000
-        with patch.object(cmd, "_convert_one_source", return_value=short_text):
+        long_text = "X" * 50000  # well over old COURT_ORDER_FULL_MAX
+        with patch.object(cmd, "_convert_one_source", return_value=long_text):
             texts = cmd._convert_sources_to_texts(
                 {
                     "charge_sheet": None,
@@ -574,30 +702,10 @@ class TestConvertSourcesToTexts:
                     "financial_docs": [],
                 }
             )
-        assert len(texts["court_orders"][0]) == 10000  # short → full
+        assert len(texts["court_orders"][0]) == 50000  # full text preserved
 
-        # Longer than COURT_ORDER_FULL_MAX → head+tail
-        long_text = "X" * (COURT_ORDER_FULL_MAX + 5000)
-        with patch.object(cmd, "_convert_one_source", return_value=long_text):
-            texts2 = cmd._convert_sources_to_texts(
-                {
-                    "charge_sheet": None,
-                    "press_releases": [],
-                    "court_orders": [source],
-                    "investigative_reports": [],
-                    "financial_docs": [],
-                }
-            )
-        truncated = texts2["court_orders"][0]
-        expected_len = (
-            COURT_ORDER_HEAD_CHARS
-            + COURT_ORDER_TAIL_CHARS
-            + len("\n\n[... मध्य भाग संक्षिप्त गरिएको — तल फैसला/सजाय खण्ड ...]\n\n")
-        )
-        assert len(truncated) == expected_len  # long → head+tail
-        assert truncated.startswith("X" * COURT_ORDER_HEAD_CHARS)
-
-    def test_truncates_investigative_reports_to_3k(self):
+    def test_investigative_reports_return_full_text(self):
+        """Truncation removed — investigative reports no longer capped at 3k."""
         cmd = Command()
         source = _make_source("src-ir-001", "IR", SourceType.INVESTIGATIVE_REPORT)
         long_text = "X" * 10000
@@ -611,7 +719,9 @@ class TestConvertSourcesToTexts:
                     "financial_docs": [],
                 }
             )
-        assert len(texts["investigative_reports"][0]) == 3000
+        assert (
+            len(texts["investigative_reports"][0]) == 10000
+        )  # full text, not truncated
 
     def test_filters_under_50_chars(self):
         cmd = Command()
@@ -911,12 +1021,10 @@ class TestProcessCaseFormatting:
 
         with (
             patch.object(cmd, "_convert_one_source", return_value="test content" * 10),
+            patch.object(cmd, "_run_map_reduce", return_value=extraction_json),
             patch.object(cmd, "_call_llm") as mock_llm,
         ):
-            mock_llm.side_effect = [
-                json.dumps(extraction_json),
-                json.dumps(format_json),
-            ]
+            mock_llm.return_value = json.dumps(format_json)
             cmd._process_case(
                 case,
                 "claude-sonnet-4-5",
@@ -949,6 +1057,7 @@ class TestProcessCaseFormatting:
         call_count = [0]
         with (
             patch.object(cmd, "_convert_one_source", return_value="test content" * 10),
+            patch.object(cmd, "_run_map_reduce", return_value=extraction_json),
             patch.object(cmd, "_call_llm") as mock_llm,
             patch.object(cmd.stdout, "write"),
             patch("time.sleep", return_value=None),
@@ -956,8 +1065,6 @@ class TestProcessCaseFormatting:
 
             def llm_side_effect(*args, **kwargs):
                 call_count[0] += 1
-                if call_count[0] == 1:
-                    return json.dumps(extraction_json)  # extraction
                 return "not valid json {{{"  # format (+ retries)
 
             mock_llm.side_effect = llm_side_effect
@@ -1102,13 +1209,14 @@ class TestPipelineIntegration:
                 return_value="test content " * 10,
             ),
             patch(
+                "cases.management.commands.enrich_case_overview.Command._run_map_reduce",
+                return_value=extraction_json,
+            ),
+            patch(
                 "cases.management.commands.enrich_case_overview.Command._call_llm"
             ) as mock_llm,
         ):
-            mock_llm.side_effect = [
-                json.dumps(extraction_json),
-                json.dumps(format_json),
-            ]
+            mock_llm.return_value = json.dumps(format_json)
             call_command("enrich_case_overview", "--dry-run")
 
         case.refresh_from_db()
@@ -1147,13 +1255,14 @@ class TestPipelineIntegration:
                 return_value="test content " * 10,
             ),
             patch(
+                "cases.management.commands.enrich_case_overview.Command._run_map_reduce",
+                return_value=extraction_json,
+            ),
+            patch(
                 "cases.management.commands.enrich_case_overview.Command._call_llm"
             ) as mock_llm,
         ):
-            mock_llm.side_effect = [
-                json.dumps(extraction_json),
-                json.dumps(format_json),
-            ]
+            mock_llm.return_value = json.dumps(format_json)
             call_command("enrich_case_overview")
 
         case.refresh_from_db()
@@ -1211,12 +1320,10 @@ class TestPipelineIntegration:
             patch.object(
                 Command, "_convert_one_source", return_value="test content " * 10
             ),
+            patch.object(Command, "_run_map_reduce", return_value=extraction_json),
             patch.object(Command, "_call_llm") as mock_llm,
         ):
-            mock_llm.side_effect = [
-                json.dumps(extraction_json),
-                json.dumps(format_json),
-            ]
+            mock_llm.return_value = json.dumps(format_json)
             call_command("enrich_case_overview", "--case-id=case-a-001")
 
         case_a.refresh_from_db()
@@ -1246,12 +1353,10 @@ class TestPipelineIntegration:
             patch.object(
                 Command, "_convert_one_source", return_value="test content " * 10
             ),
+            patch.object(Command, "_run_map_reduce", return_value=extraction_json),
             patch.object(Command, "_call_llm") as mock_llm,
         ):
-            mock_llm.side_effect = [
-                json.dumps(extraction_json),
-                json.dumps(result_json),
-            ]
+            mock_llm.return_value = json.dumps(result_json)
             call_command("enrich_case_overview", "--force")
 
         case.refresh_from_db()
@@ -1278,12 +1383,10 @@ class TestPipelineIntegration:
             patch.object(
                 Command, "_convert_one_source", return_value="test content " * 10
             ),
+            patch.object(Command, "_run_map_reduce", return_value=extraction_json),
             patch.object(Command, "_call_llm") as mock_llm,
         ):
-            mock_llm.side_effect = [
-                json.dumps(extraction_json),
-                json.dumps(format_json),
-            ] * 3
+            mock_llm.return_value = json.dumps(format_json)
             call_command("enrich_case_overview", "--limit=2")
 
         enriched = (
@@ -1374,7 +1477,7 @@ class TestErrorHandling:
         assert json.loads(result) == {"result": "ok"}
         assert call_count[0] == 2
 
-    def test_llm_call_handles_extraction_json_parse_failure(self):
+    def test_map_reduce_failure_triggers_extraction_failure(self):
         source = _make_source(
             "src-errtest-001", "Press Release — CIAA", SourceType.OFFICIAL_GOVERNMENT
         )
@@ -1388,7 +1491,7 @@ class TestErrorHandling:
 
         with (
             patch.object(cmd, "_convert_one_source", return_value="test content " * 10),
-            patch.object(cmd, "_call_llm", return_value="not json at all {{{"),
+            patch.object(cmd, "_run_map_reduce", return_value=None),
             patch("time.sleep", return_value=None),
         ):
             cmd._process_case(
@@ -1404,7 +1507,7 @@ class TestErrorHandling:
         assert cmd.stats["llm_extraction_failures"] == 1
         assert cmd.stats["cases_failed"] == 1
 
-    def test_extraction_result_not_dict_is_handled(self):
+    def test_map_reduce_non_dict_result_triggers_failure(self):
         source = _make_source(
             "src-errtest-002", "Press Release — CIAA", SourceType.OFFICIAL_GOVERNMENT
         )
@@ -1418,7 +1521,7 @@ class TestErrorHandling:
 
         with (
             patch.object(cmd, "_convert_one_source", return_value="test content " * 10),
-            patch.object(cmd, "_call_llm", return_value="[1, 2, 3]"),
+            patch.object(cmd, "_run_map_reduce", return_value=[]),
             patch("time.sleep", return_value=None),
         ):
             cmd._process_case(

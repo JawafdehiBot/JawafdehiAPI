@@ -72,6 +72,7 @@ See also
 - ``services/jawafdehi-api/cases/models.py`` — Case, DocumentSource models.
 """
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -89,7 +90,7 @@ from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from cases.models import Case, CaseState, CaseType, DocumentSource, SourceType
 from cases.services.priority_case_loader import filter_by_priority, load_priority_cases
@@ -105,6 +106,9 @@ LLM_EMPTY_RESPONSE_RETRIES = 5  # tolerate more empty-stream retries (proxy mode
 COURT_ORDER_HEAD_CHARS = 12000
 COURT_ORDER_TAIL_CHARS = 6000
 COURT_ORDER_FULL_MAX = 18000  # if ≤ this, send whole doc; else head+tail
+CHUNK_SIZE = 15000  # chars per chunk for map-reduce
+CHUNK_OVERLAP = 1000  # overlap between adjacent chunks
+_MAX_PARSE_RETRIES = 3  # retries for JSON parse failures in LLM response
 DEVANAGARI_ALPHABETIC_RE = re.compile(r"[ऄ-हक़-ॡ]")
 ALPHABETIC_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 _LLM_PROMPT_SIZE_WARN = 60000
@@ -289,6 +293,31 @@ IMPORTANT:
 - extraction_quality_notes: brief summary if any section relied on heavily
   garbled text (null if all text was clean).
 - Prefer court order data when multiple sources conflict on facts."""
+
+CHUNK_EXTRACTION_PROMPT = """\
+Extract any structured case data present in this section (chunk {chunk_index}/{total_chunks}) of a CIAA corruption case {doc_type}.
+
+Document section:
+{chunk_text}
+
+Return valid JSON with these exact keys (use null for missing data):
+
+{{
+  "accused_persons": [{{"name": "str (required)", "position": "str|null", "institution": "str|null", "employment_dates": "str|null", "role_in_case": "str|null"}}],
+  "case_metadata": {{"case_number": "str|null", "filing_date": "str|null", "court": "str|null", "verdict_date": "str|null", "sentencing_date": "str|null", "charge_sheet_number": "str|null", "complaint_numbers": ["str"], "investigation_period": "str|null"}},
+  "fiscal_analysis": [{{"fiscal_year": "str (required)", "income": "str|null", "expenditure": "str|null", "balance": "str|null", "source_detail": "str|null"}}],
+  "legal_provisions": [{{"act": "str (required)", "section": "str|null", "description": "str|null", "penalty": "str|null"}}],
+  "key_events": [{{"date": "str (required, Nepali VS)", "description": "str (required)"}}],
+  "total_disputed_amount": "str|null",
+  "extraction_quality_notes": "str|null"
+}}
+
+Rules:
+- Return ONLY a valid JSON object. No markdown fences. No explanation.
+- Extract ONLY information explicitly present. Do NOT fabricate.
+- Dates in Nepali Vikram Samvat. Amounts in NPR.
+- If nothing relevant is found in this section, return empty arrays and nulls.
+- extraction_quality_notes: note if text corruption made extraction unreliable."""
 
 FORMATTING_SYSTEM_PROMPT = """\
 You are a Nepali legal writer for JAWAFDEHI, Nepal's public corruption case
@@ -543,6 +572,30 @@ def safe_truncate(text: str | None, max_chars: int = 15000) -> str:
     if not text:
         return ""
     return text[:max_chars]
+
+
+def chunk_document_text(
+    text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
+    """Split text into overlapping chunks for map-reduce extraction.
+
+    Overlap protects contextual continuity across chunk boundaries
+    for Devanagari legal text.  Each chunk is at most chunk_size chars.
+    The final chunk may be shorter.
+    """
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start += chunk_size - overlap
+    return chunks
 
 
 class Command(BaseCommand):
@@ -820,18 +873,17 @@ class Command(BaseCommand):
         for src in gathered["press_releases"]:
             t = self._convert_one_source(src)
             if t and len(t.strip()) >= 50:
-                # Truncate long press releases
-                texts["press_releases"].append(t[:5000])
-        # Court orders — head+tail for long docs (verdict usually at end)
+                texts["press_releases"].append(t)
+        # Court orders — full text (map-reduce handles chunking)
         for src in gathered["court_orders"]:
             t = self._convert_one_source(src)
             if t and len(t.strip()) >= 50:
-                texts["court_orders"].append(_truncate_long_doc(t))
+                texts["court_orders"].append(t)
         # Investigative reports
         for src in gathered["investigative_reports"]:
             t = self._convert_one_source(src)
             if t and len(t.strip()) >= 50:
-                texts["investigative_reports"].append(t[:3000])
+                texts["investigative_reports"].append(t)
         # Financial docs
         for src in gathered["financial_docs"]:
             t = self._convert_one_source(src)
@@ -1115,6 +1167,111 @@ class Command(BaseCommand):
             "court_order_texts": court_order_texts,
         }
 
+    # ── Map-reduce extraction ──────────────────────────────────────
+
+    async def _extract_chunk_async(
+        self,
+        chunk_text: str,
+        doc_type: str,
+        chunk_index: int,
+        total_chunks: int,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout: int,
+    ) -> dict:
+        """Extract structured data from a single chunk via AsyncOpenAI."""
+        prompt = CHUNK_EXTRACTION_PROMPT.format(
+            chunk_index=chunk_index + 1,
+            total_chunks=total_chunks,
+            doc_type=doc_type,
+            chunk_text=chunk_text,
+        )
+        client = AsyncOpenAI(
+            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+        )
+        for attempt in range(1, 4):
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                    stream=False,
+                    temperature=0.1,
+                    max_tokens=4000,
+                )
+                raw = response.choices[0].message.content or ""
+                parsed = json.loads(_extract_json_body(raw))
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception as exc:
+                logger.warning(
+                    "Chunk %d/%d attempt %d failed: %s",
+                    chunk_index + 1,
+                    total_chunks,
+                    attempt,
+                    exc,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(2**attempt)
+        return {}
+
+    def _run_map_reduce(
+        self,
+        source_texts: dict,
+        model: str,
+        base_url: str,
+        api_key: str,
+        timeout: int,
+    ) -> dict | None:
+        """Orchestrate map-reduce: chunk sources → parallel async extraction → merge.
+
+        Returns merged JSON dict, or None if no chunks could be processed.
+        """
+        chunks = []
+        for doc_type in (
+            "court_orders",
+            "press_releases",
+            "investigative_reports",
+            "financial_docs",
+        ):
+            for text in source_texts.get(doc_type) or []:
+                chunks.extend(chunk_document_text(text))
+
+        if not chunks:
+            logger.warning("No chunks produced from source texts")
+            return None
+
+        logger.info("Map-reduce: %d chunks from source texts", len(chunks))
+
+        async def _run():
+            tasks = [
+                self._extract_chunk_async(
+                    chunk_text=chunk,
+                    doc_type="court order / evidence document",
+                    chunk_index=i,
+                    total_chunks=len(chunks),
+                    model=model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    timeout=timeout,
+                )
+                for i, chunk in enumerate(chunks)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            parsed = []
+            for r in results:
+                if isinstance(r, dict):
+                    parsed.append(r)
+                elif isinstance(r, Exception):
+                    logger.warning("Chunk extraction raised: %s", r)
+            logger.info("Map-reduce: %d/%d chunks succeeded", len(parsed), len(chunks))
+            return self._merge_chunk_extractions(parsed)
+
+        return asyncio.run(_run())
+
     # ── Per-case processing ───────────────────────────────────────
 
     def _process_case(
@@ -1200,138 +1357,167 @@ class Command(BaseCommand):
             f"financial={len(source_texts['financial_docs'])}"
         )
 
-        # Build supplementary source sections for the prompt
-        press_text = (
-            "\n\n---\n\n".join(
-                f"Press Release {i+1}:\n{t}"
-                for i, t in enumerate(source_texts["press_releases"])
-            )
-            if source_texts["press_releases"]
-            else "(No press releases available)"
-        )
+        # ── Extraction: map-reduce for opencode, single-call for Anthropic ──
 
-        truncated_orders = [t[:5000] for t in source_texts["court_orders"]]
-        court_joined = ""
-        court_total = 0
-        for i, t in enumerate(truncated_orders):
-            header = f"Court Order {i+1}:\n"
-            sep = "\n\n---\n\n" if court_joined else ""
-            chunk = sep + header + t
-            if court_total + len(chunk) > 15000:
-                break
-            court_joined += chunk
-            court_total += len(chunk)
-        court_text = court_joined if court_joined else "(No court orders available)"
-
-        investigative_text = (
-            "\n\n---\n\n".join(
-                f"Investigative Report {i+1}:\n{t}"
-                for i, t in enumerate(source_texts["investigative_reports"])
-            )
-            if source_texts["investigative_reports"]
-            else "(No investigative reports available)"
-        )
-
-        financial_text = (
-            "\n\n---\n\n".join(
-                f"Financial Document {i+1}:\n{t}"
-                for i, t in enumerate(source_texts["financial_docs"])
-            )
-            if source_texts["financial_docs"]
-            else "(No financial documents available)"
-        )
-
-        # LLM Call #1: Extract structured data from ALL sources
-        bigo = f"रू {case.bigo:,}" if case.bigo else "उल्लेख छैन"
-        prompt = EXTRACTION_USER_PROMPT.format(
-            case_id=case.case_id,
-            case_title=case.title,
-            court_cases=(
-                json.dumps(case.court_cases, ensure_ascii=False)
-                if case.court_cases
-                else "None"
-            ),
-            bigo=bigo,
-            press_release_texts=press_text[:10000],
-            court_order_texts=court_text[:32000],
-            other_texts=(
-                f"Supplementary:\n{investigative_text[:3000]}\n\n{financial_text[:4000]}"
-                if (
-                    source_texts["investigative_reports"]
-                    or source_texts["financial_docs"]
-                )
-                else "(No additional documents)"
-            ),
-            source_quality_notes_section=(
-                "NOTE: Press release text may contain character-level corruption "
-                "from PDF extraction (~60-70% accuracy). Court order text is "
-                "typically 95%+ clean. Trust court order over press release when "
-                "they conflict on facts, names, dates, or legal citations."
-            ),
-        )
-
-        self.stdout.write(
-            f"  [1/2] Extracting structured data "
-            f"(charge_sheet={len(source_texts['charge_sheet'])} chars)..."
-        )
-        logger.info(
-            "Case %s: step=extract status=calling charge_sheet=%d press_releases=%d court_orders=%d",
-            case.case_id,
-            len(source_texts["charge_sheet"]),
-            len(source_texts["press_releases"]),
-            len(source_texts["court_orders"]),
-        )
-
-        # Extract step with JSON-parse retry
-        extracted_json = None
-        _MAX_PARSE_RETRIES = 3
-        for parse_attempt in range(1, _MAX_PARSE_RETRIES + 1):
-            raw = self._call_llm(
-                model,
-                base_url,
-                api_key,
-                timeout,
-                is_opencode,
-                EXTRACTION_SYSTEM_PROMPT,
-                prompt,
-                step_tag="extract",
-            )
-            try:
-                extracted_json = json.loads(raw or "")
-            except json.JSONDecodeError:
-                extracted_json = None
-            if isinstance(extracted_json, dict):
-                break
-            logger.warning(
-                "Case %s: step=extract status=parse_retry attempt=%d/%d raw_len=%d",
-                case.case_id,
-                parse_attempt,
-                _MAX_PARSE_RETRIES,
-                len(raw or ""),
-            )
+        if is_opencode:
             self.stdout.write(
-                self.style.WARNING(
-                    f"  Extraction parse failed attempt {parse_attempt}, retrying..."
-                )
+                f"  [1/2] Extracting structured data via map-reduce "
+                f"(charge_sheet={len(source_texts['charge_sheet'])} chars, "
+                f"press_releases={sum(len(t) for t in source_texts['press_releases'])} chars, "
+                f"court_orders={sum(len(t) for t in source_texts['court_orders'])} chars)..."
             )
-            time.sleep(1)  # brief pause before re-request
-        if not isinstance(extracted_json, dict):
-            self.stats["llm_extraction_failures"] += 1
-            self.stats["cases_failed"] += 1
-            snippet = (raw or "")[:500]
-            logger.error(
-                "Case %s: step=extract status=failed reason=invalid_json raw_len=%d snippet=%r",
+            logger.info(
+                "Case %s: step=extract method=map_reduce charge_sheet=%d press_releases=%d court_orders=%d",
                 case.case_id,
-                len(raw or ""),
-                snippet,
+                len(source_texts["charge_sheet"]),
+                len(source_texts["press_releases"]),
+                len(source_texts["court_orders"]),
             )
-            self.stdout.write(
-                self.style.ERROR(
-                    f"  FAILED: Extraction returned invalid JSON "
-                    f"(raw: {snippet[:200]})"
+            extracted_json = self._run_map_reduce(
+                source_texts, model, base_url, api_key, timeout
+            )
+            if not isinstance(extracted_json, dict) or not extracted_json:
+                self.stats["llm_extraction_failures"] += 1
+                self.stats["cases_failed"] += 1
+                logger.error(
+                    "Case %s: step=extract status=failed reason=map_reduce_failed",
+                    case.case_id,
                 )
+                self.stdout.write(
+                    self.style.ERROR("  FAILED: Map-reduce extraction produced no data")
+                )
+                return
+        else:
+            # Anthropic fallback: truncate at prompt assembly time
+            press_text = (
+                "\n\n---\n\n".join(
+                    f"Press Release {i+1}:\n{t}"
+                    for i, t in enumerate(source_texts["press_releases"])
+                )
+                if source_texts["press_releases"]
+                else "(No press releases available)"
             )
-            return
+
+            truncated_orders = [t[:5000] for t in source_texts["court_orders"]]
+            court_joined = ""
+            court_total = 0
+            for i, t in enumerate(truncated_orders):
+                header = f"Court Order {i+1}:\n"
+                sep = "\n\n---\n\n" if court_joined else ""
+                chunk = sep + header + t
+                if court_total + len(chunk) > 15000:
+                    break
+                court_joined += chunk
+                court_total += len(chunk)
+            court_text = court_joined if court_joined else "(No court orders available)"
+
+            investigative_text = (
+                "\n\n---\n\n".join(
+                    f"Investigative Report {i+1}:\n{t}"
+                    for i, t in enumerate(source_texts["investigative_reports"])
+                )
+                if source_texts["investigative_reports"]
+                else "(No investigative reports available)"
+            )
+
+            financial_text = (
+                "\n\n---\n\n".join(
+                    f"Financial Document {i+1}:\n{t}"
+                    for i, t in enumerate(source_texts["financial_docs"])
+                )
+                if source_texts["financial_docs"]
+                else "(No financial documents available)"
+            )
+
+            bigo = f"रू {case.bigo:,}" if case.bigo else "उल्लेख छैन"
+            prompt = EXTRACTION_USER_PROMPT.format(
+                case_id=case.case_id,
+                case_title=case.title,
+                court_cases=(
+                    json.dumps(case.court_cases, ensure_ascii=False)
+                    if case.court_cases
+                    else "None"
+                ),
+                bigo=bigo,
+                press_release_texts=press_text[:10000],
+                court_order_texts=court_text[:32000],
+                other_texts=(
+                    f"Supplementary:\n{investigative_text[:3000]}\n\n{financial_text[:4000]}"
+                    if (
+                        source_texts["investigative_reports"]
+                        or source_texts["financial_docs"]
+                    )
+                    else "(No additional documents)"
+                ),
+                source_quality_notes_section=(
+                    "NOTE: Press release text may contain character-level corruption "
+                    "from PDF extraction (~60-70% accuracy). Court order text is "
+                    "typically 95%+ clean. Trust court order over press release when "
+                    "they conflict on facts, names, dates, or legal citations."
+                ),
+            )
+
+            self.stdout.write(
+                f"  [1/2] Extracting structured data "
+                f"(charge_sheet={len(source_texts['charge_sheet'])} chars)..."
+            )
+            logger.info(
+                "Case %s: step=extract status=calling charge_sheet=%d press_releases=%d court_orders=%d",
+                case.case_id,
+                len(source_texts["charge_sheet"]),
+                len(source_texts["press_releases"]),
+                len(source_texts["court_orders"]),
+            )
+
+            # Extract step with JSON-parse retry
+            extracted_json = None
+            for parse_attempt in range(1, _MAX_PARSE_RETRIES + 1):
+                raw = self._call_llm(
+                    model,
+                    base_url,
+                    api_key,
+                    timeout,
+                    is_opencode,
+                    EXTRACTION_SYSTEM_PROMPT,
+                    prompt,
+                    step_tag="extract",
+                )
+                try:
+                    extracted_json = json.loads(raw or "")
+                except json.JSONDecodeError:
+                    extracted_json = None
+                if isinstance(extracted_json, dict):
+                    break
+                logger.warning(
+                    "Case %s: step=extract status=parse_retry attempt=%d/%d raw_len=%d",
+                    case.case_id,
+                    parse_attempt,
+                    _MAX_PARSE_RETRIES,
+                    len(raw or ""),
+                )
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"  Extraction parse failed attempt {parse_attempt}, retrying..."
+                    )
+                )
+                time.sleep(1)
+            if not isinstance(extracted_json, dict):
+                self.stats["llm_extraction_failures"] += 1
+                self.stats["cases_failed"] += 1
+                snippet = (raw or "")[:500]
+                logger.error(
+                    "Case %s: step=extract status=failed reason=invalid_json raw_len=%d snippet=%r",
+                    case.case_id,
+                    len(raw or ""),
+                    snippet,
+                )
+                self.stdout.write(
+                    self.style.ERROR(
+                        f"  FAILED: Extraction returned invalid JSON "
+                        f"(raw: {snippet[:200]})"
+                    )
+                )
+                return
 
         logger.info(
             "Case %s: step=extract status=ok keys=%s",
@@ -1949,6 +2135,91 @@ class Command(BaseCommand):
 
         return valid, issues
 
+    @staticmethod
+    def _merge_chunk_extractions(chunks: list[dict]) -> dict:
+        """Merge partial extraction dicts from parallel chunk processing.
+
+        Dedup logic:
+        - accused_persons: by name
+        - fiscal_analysis: by fiscal_year
+        - legal_provisions: by section
+        - key_events: by (date, description)
+        - case_metadata: first non-null per field
+        - total_disputed_amount: first non-null
+        - extraction_quality_notes: concatenate
+        """
+        merged = {
+            "accused_persons": [],
+            "case_metadata": {},
+            "fiscal_analysis": [],
+            "legal_provisions": [],
+            "key_events": [],
+            "total_disputed_amount": None,
+            "extraction_quality_notes": None,
+        }
+
+        seen_names = set()
+        seen_fiscal_years = set()
+        seen_sections = set()
+        seen_events = set()
+
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+
+            for ap in chunk.get("accused_persons") or []:
+                if (
+                    isinstance(ap, dict)
+                    and ap.get("name")
+                    and ap["name"] not in seen_names
+                ):
+                    seen_names.add(ap["name"])
+                    merged["accused_persons"].append(ap)
+
+            for fa in chunk.get("fiscal_analysis") or []:
+                if (
+                    isinstance(fa, dict)
+                    and fa.get("fiscal_year")
+                    and fa["fiscal_year"] not in seen_fiscal_years
+                ):
+                    seen_fiscal_years.add(fa["fiscal_year"])
+                    merged["fiscal_analysis"].append(fa)
+
+            for lp in chunk.get("legal_provisions") or []:
+                if (
+                    isinstance(lp, dict)
+                    and lp.get("section")
+                    and lp["section"] not in seen_sections
+                ):
+                    seen_sections.add(lp["section"])
+                    merged["legal_provisions"].append(lp)
+
+            for ke in chunk.get("key_events") or []:
+                if isinstance(ke, dict) and ke.get("date") and ke.get("description"):
+                    key = (ke["date"], ke["description"])
+                    if key not in seen_events:
+                        seen_events.add(key)
+                        merged["key_events"].append(ke)
+
+            meta = chunk.get("case_metadata")
+            if isinstance(meta, dict):
+                for k, v in meta.items():
+                    if v is not None and merged["case_metadata"].get(k) is None:
+                        merged["case_metadata"][k] = v
+
+            if merged["total_disputed_amount"] is None:
+                merged["total_disputed_amount"] = chunk.get("total_disputed_amount")
+
+            notes = chunk.get("extraction_quality_notes")
+            if notes:
+                existing = merged["extraction_quality_notes"]
+                if existing:
+                    merged["extraction_quality_notes"] = f"{existing}; {notes}"
+                else:
+                    merged["extraction_quality_notes"] = notes
+
+        return merged
+
     # ── Helpers ────────────────────────────────────────────────────
 
     def _skip_no_content(self, case, note, dry_run):
@@ -2102,21 +2373,4 @@ def _source_url_priority(url):
         int(parsed.netloc.lower() == "ngm-store.jawafdehi.org"),
         int(path.endswith(".pdf")),
         int(path.endswith((".pdf", ".doc", ".docx"))),
-    )
-
-
-def _truncate_long_doc(text: str) -> str:
-    """Head+tail extraction for long court orders.
-
-    Short docs (≤COURT_ORDER_FULL_MAX): return full text.
-    Long docs: return head (identity, charges, narrative) + tail (verdict, sentencing).
-    Middle sections (witness playback, evidence replay) are skipped — the LLM
-    captures those from the head's summary paragraphs.
-    """
-    if len(text) <= COURT_ORDER_FULL_MAX:
-        return text
-    head = text[:COURT_ORDER_HEAD_CHARS]
-    tail = text[-COURT_ORDER_TAIL_CHARS:]
-    return (
-        head + "\n\n[... मध्य भाग संक्षिप्त गरिएको — तल फैसला/सजाय खण्ड ...]\n\n" + tail
     )
