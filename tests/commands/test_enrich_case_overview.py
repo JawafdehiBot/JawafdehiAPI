@@ -45,6 +45,7 @@ from cases.management.commands.enrich_case_overview import (
     chunk_document_text,
     normalize_base_url,
     normalize_model,
+    sanitize_nepali_text,
 )
 from cases.models import Case, CaseState, CaseType, DocumentSource, SourceType
 
@@ -144,6 +145,28 @@ class TestChunkDocumentText:
         result = chunk_document_text(text, chunk_size=CHUNK_SIZE, overlap=1000)
         assert len(result) == 2
         assert len(result[0]) == CHUNK_SIZE
+
+
+class TestSanitizeNepaliText:
+    def test_strips_question_mark_blocks(self):
+        assert sanitize_nepali_text("hello???world") == "helloworld"
+        assert sanitize_nepali_text("a?????b") == "ab"
+
+    def test_strips_zwj_and_zwnj(self):
+        assert sanitize_nepali_text("hello‌world‍") == "helloworld"
+
+    def test_handles_empty_string(self):
+        assert sanitize_nepali_text("") == ""
+        assert sanitize_nepali_text(None) == ""  # type: ignore[arg-type]
+
+    def test_preserves_clean_nepali_text(self):
+        text = "प्रस्तुत मुद्दामा अख्तियारको प्रतिवादी"
+        assert sanitize_nepali_text(text) == text
+
+    def test_mixed_clean_and_dirty(self):
+        raw = "प्रस्तुत मुद्दामा??? अख्तियारको‌ प्रतिवादी"
+        expected = "प्रस्तुत मुद्दामा अख्तियारको प्रतिवादी"
+        assert sanitize_nepali_text(raw) == expected
 
 
 class TestMergeChunkExtractions:
