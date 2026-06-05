@@ -1272,7 +1272,7 @@ class TestErrorHandling:
                     "prompt",
                 )
 
-        assert call_count[0] == 3
+        assert call_count[0] == 5
 
     def test_llm_call_retries_on_empty_and_succeeds(self):
         cmd = Command()

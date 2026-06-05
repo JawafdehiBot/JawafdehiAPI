@@ -100,7 +100,8 @@ MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 DOWNLOAD_CHUNK_SIZE = 16 * 1024
 DEFAULT_OPENCODE_BASE = "https://llm-proxy.jawafdehi.org/v1"
 DEFAULT_LLM_TIMEOUT = 300
-MAX_LLM_RETRIES = 3
+MAX_LLM_RETRIES = 5
+LLM_EMPTY_RESPONSE_RETRIES = 5  # tolerate more empty-stream retries (proxy model quirk)
 COURT_ORDER_HEAD_CHARS = 12000
 COURT_ORDER_TAIL_CHARS = 6000
 COURT_ORDER_FULL_MAX = 18000  # if ≤ this, send whole doc; else head+tail
@@ -671,9 +672,7 @@ class Command(BaseCommand):
 
         for idx, case in enumerate(cases, 1):
             self.stdout.write(
-                self._safe_output_text(
-                    f"\n[{idx}/{len(cases)}] {case.case_id} - {case.title[:80]}..."
-                )
+                f"\n[{idx}/{len(cases)}] {case.case_id} - {case.title[:80]}..."
             )
             logger.info("[%d/%d] Processing case %s", idx, len(cases), case.case_id)
             try:
@@ -1171,11 +1170,18 @@ class Command(BaseCommand):
             primary = gathered["charge_sheet"]
         elif gathered["press_releases"]:
             primary = gathered["press_releases"][0]
+        elif gathered["court_orders"]:
+            primary = gathered["court_orders"][0]
         else:
             primary = None
         if primary:
             self.stdout.write(
-                self._safe_output_text(f"  Source: {self._describe_source(primary)}")
+                f"  Source: {self._describe_source(primary)}"
+            )
+        # Also print court order source when primary isn't already a court order
+        if gathered["court_orders"] and primary != gathered["court_orders"][0]:
+            self.stdout.write(
+                f"  Court order source: {self._describe_source(gathered['court_orders'][0])}"
             )
         self.stdout.write(
             f"  Gathered: charge_sheet={'yes' if source_texts['charge_sheet'] else 'no'}, "
@@ -1284,13 +1290,18 @@ class Command(BaseCommand):
         if not isinstance(extracted_json, dict):
             self.stats["llm_extraction_failures"] += 1
             self.stats["cases_failed"] += 1
+            snippet = (raw or "")[:500]
             logger.error(
-                "Case %s: step=extract status=failed reason=invalid_json raw_len=%d",
+                "Case %s: step=extract status=failed reason=invalid_json raw_len=%d snippet=%r",
                 case.case_id,
                 len(raw or ""),
+                snippet,
             )
             self.stdout.write(
-                self.style.ERROR("  FAILED: Extraction returned invalid JSON")
+                self.style.ERROR(
+                    f"  FAILED: Extraction returned invalid JSON "
+                    f"(raw: {snippet[:200]})"
+                )
             )
             return
 
@@ -1362,13 +1373,18 @@ class Command(BaseCommand):
         if not isinstance(formatted, dict):
             self.stats["llm_formatting_failures"] += 1
             self.stats["cases_failed"] += 1
+            snippet = (raw or "")[:500]
             logger.error(
-                "Case %s: step=format status=failed reason=invalid_json raw_len=%d",
+                "Case %s: step=format status=failed reason=invalid_json raw_len=%d snippet=%r",
                 case.case_id,
                 len(raw or ""),
+                snippet,
             )
             self.stdout.write(
-                self.style.ERROR("  FAILED: Formatting returned invalid JSON")
+                self.style.ERROR(
+                    f"  FAILED: Formatting returned invalid JSON "
+                    f"(raw: {snippet[:200]})"
+                )
             )
             return
 
@@ -1520,8 +1536,8 @@ class Command(BaseCommand):
                     logger.warning(
                         "LLM stream: step=%s attempt=%d — empty response", step_tag, attempt,
                     )
-                    if attempt < MAX_LLM_RETRIES:
-                        wait = 2**attempt
+                    if attempt < LLM_EMPTY_RESPONSE_RETRIES:
+                        wait = 2**attempt + 5  # base 2s + 5s buffer for proxy cold-start
                         self.stdout.write(
                             self.style.WARNING(
                                 f"  LLM empty response attempt {attempt}, retry in {wait}s..."
@@ -1530,7 +1546,7 @@ class Command(BaseCommand):
                         time.sleep(wait)
                         continue
                     raise CommandError(
-                        f"LLM empty response after {MAX_LLM_RETRIES} attempts"
+                        f"LLM empty response after {LLM_EMPTY_RESPONSE_RETRIES} attempts"
                     )
                 return _extract_json_body(accumulated)
 
