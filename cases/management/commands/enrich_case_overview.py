@@ -129,6 +129,15 @@ PRESS_RELEASE_KEYWORDS = [
     "प्रेस विज्ञप्ति",  # प्रेस विज्ञप्ति
     "विज्ञप्ति",  # विज्ञप्ति
 ]
+COURT_ORDER_KEYWORDS = [
+    "court order",
+    "courtorder",
+    "court-order",
+    "फैसला",
+    "आदेश",
+    "निर्णय",
+    "verdict",
+]
 
 GARBLED_LEGAL_TERMS = frozenset(
     {
@@ -526,8 +535,6 @@ def _extract_json_body(raw: str) -> str:
     return raw
 
 
-
-
 def safe_truncate(text: str | None, max_chars: int = 15000) -> str:
     """Character-safe truncation for Devanagari text.
     Python str slicing operates on Unicode code points, not bytes,
@@ -770,12 +777,16 @@ class Command(BaseCommand):
                 if _has_charge_sheet_keywords(source):
                     if not gathered["charge_sheet"]:
                         gathered["charge_sheet"] = source
+                elif _has_court_order_keywords(source):
+                    gathered["court_orders"].append(source)
                 elif _has_press_release_keywords(source) or _has_ngm_store_url(source):
                     gathered["press_releases"].append(source)
                 else:
                     gathered["other_docs"].append(source)
             elif stype == SourceType.LEGAL_PROCEDURAL:
-                if _has_press_release_keywords(source) or _has_ngm_store_url(source):
+                if _has_court_order_keywords(source):
+                    gathered["court_orders"].append(source)
+                elif _has_press_release_keywords(source) or _has_ngm_store_url(source):
                     gathered["press_releases"].append(source)
                 else:
                     gathered["procedural_docs"].append(source)
@@ -1165,19 +1176,17 @@ class Command(BaseCommand):
             logger.warning("Case %s: step=skip reason=conversion_failed", case.case_id)
             return
 
-        # Primary source description for logging
+        # Primary source description for logging (court order > press release)
         if gathered["charge_sheet"]:
             primary = gathered["charge_sheet"]
-        elif gathered["press_releases"]:
-            primary = gathered["press_releases"][0]
         elif gathered["court_orders"]:
             primary = gathered["court_orders"][0]
+        elif gathered["press_releases"]:
+            primary = gathered["press_releases"][0]
         else:
             primary = None
         if primary:
-            self.stdout.write(
-                f"  Source: {self._describe_source(primary)}"
-            )
+            self.stdout.write(f"  Source: {self._describe_source(primary)}")
         # Also print court order source when primary isn't already a court order
         if gathered["court_orders"] and primary != gathered["court_orders"][0]:
             self.stdout.write(
@@ -1295,7 +1304,10 @@ class Command(BaseCommand):
                 break
             logger.warning(
                 "Case %s: step=extract status=parse_retry attempt=%d/%d raw_len=%d",
-                case.case_id, parse_attempt, _MAX_PARSE_RETRIES, len(raw or ""),
+                case.case_id,
+                parse_attempt,
+                _MAX_PARSE_RETRIES,
+                len(raw or ""),
             )
             self.stdout.write(
                 self.style.WARNING(
@@ -1394,7 +1406,10 @@ class Command(BaseCommand):
                 break
             logger.warning(
                 "Case %s: step=format status=parse_retry attempt=%d/%d raw_len=%d",
-                case.case_id, parse_attempt, _MAX_PARSE_RETRIES, len(raw or ""),
+                case.case_id,
+                parse_attempt,
+                _MAX_PARSE_RETRIES,
+                len(raw or ""),
             )
             self.stdout.write(
                 self.style.WARNING(
@@ -1482,7 +1497,14 @@ class Command(BaseCommand):
     # ── LLM calls ──────────────────────────────────────────────────
 
     def _call_llm(
-        self, model, base_url, api_key, timeout, is_opencode, system_prompt, prompt,
+        self,
+        model,
+        base_url,
+        api_key,
+        timeout,
+        is_opencode,
+        system_prompt,
+        prompt,
         step_tag="LLM",
     ):
         backend = "stream" if is_opencode else "anthropic"
@@ -1495,7 +1517,13 @@ class Command(BaseCommand):
         )
         if is_opencode:
             return self._call_llm_stream(
-                model, base_url, api_key, timeout, system_prompt, prompt, step_tag=step_tag,
+                model,
+                base_url,
+                api_key,
+                timeout,
+                system_prompt,
+                prompt,
+                step_tag=step_tag,
             )
         return self._call_llm_anthropic(
             model, base_url, api_key, timeout, system_prompt, prompt
@@ -1519,12 +1547,17 @@ class Command(BaseCommand):
         total_chars = len(prompt)
         logger.info(
             "LLM stream: step=%s model=%s prompt_len=%d timeout=%d",
-            step_tag, model, total_chars, timeout,
+            step_tag,
+            model,
+            total_chars,
+            timeout,
         )
         if total_chars > _LLM_PROMPT_SIZE_WARN:
             logger.warning(
                 "LLM stream: step=%s HIGH PAYLOAD WARNING: %d chars (>%d)",
-                step_tag, total_chars, _LLM_PROMPT_SIZE_WARN,
+                step_tag,
+                total_chars,
+                _LLM_PROMPT_SIZE_WARN,
             )
 
         messages = []
@@ -1551,7 +1584,9 @@ class Command(BaseCommand):
                         resolved_model = getattr(chunk, "model", "unknown") or "unknown"
                         logger.info(
                             "LLM stream: step=%s TTFT=%.2fs resolved_model=%s",
-                            step_tag, ttft, resolved_model,
+                            step_tag,
+                            ttft,
+                            resolved_model,
                         )
                         ttft_recorded = True
                     if chunk.choices and chunk.choices[0].delta.content is not None:
@@ -1561,15 +1596,23 @@ class Command(BaseCommand):
                 logger.info(
                     "LLM stream: step=%s attempt=%d succeeded "
                     "gen_time=%.2fs response_len=%d model=%s",
-                    step_tag, attempt, total_duration, len(accumulated), resolved_model,
+                    step_tag,
+                    attempt,
+                    total_duration,
+                    len(accumulated),
+                    resolved_model,
                 )
 
                 if not accumulated.strip():
                     logger.warning(
-                        "LLM stream: step=%s attempt=%d — empty response", step_tag, attempt,
+                        "LLM stream: step=%s attempt=%d — empty response",
+                        step_tag,
+                        attempt,
                     )
                     if attempt < LLM_EMPTY_RESPONSE_RETRIES:
-                        wait = 2**attempt + 5  # base 2s + 5s buffer for proxy cold-start
+                        wait = (
+                            2**attempt + 5
+                        )  # base 2s + 5s buffer for proxy cold-start
                         self.stdout.write(
                             self.style.WARNING(
                                 f"  LLM empty response attempt {attempt}, retry in {wait}s..."
@@ -1585,7 +1628,10 @@ class Command(BaseCommand):
             except Exception as exc:
                 logger.warning(
                     "LLM stream: step=%s attempt=%d — %s: %s",
-                    step_tag, attempt, type(exc).__name__, exc,
+                    step_tag,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
                 )
                 if attempt < MAX_LLM_RETRIES:
                     wait = 2**attempt
@@ -2000,6 +2046,11 @@ def detect_corrupted_text(text: str) -> list:
 def _has_press_release_keywords(source) -> bool:
     corpus = (source.title + " " + (source.description or "")).lower()
     return any(kw in corpus for kw in PRESS_RELEASE_KEYWORDS)
+
+
+def _has_court_order_keywords(source) -> bool:
+    corpus = (source.title + " " + (source.description or "")).lower()
+    return any(kw in corpus for kw in COURT_ORDER_KEYWORDS)
 
 
 def _has_ngm_store_url(source) -> bool:
