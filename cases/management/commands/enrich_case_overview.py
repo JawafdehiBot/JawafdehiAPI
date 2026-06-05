@@ -36,7 +36,7 @@ Other ``source_type`` values map directly (LEGAL_COURT_ORDER → court_orders, e
 
 LLM backends
 ------------
-- OpenAI-compatible (OpenCode proxy) via ``_call_llm_opencode()``
+- OpenAI-compatible proxy (``https://llm-proxy.jawafdehi.org/v1``) via ``_call_llm_stream()``
 - Anthropic Messages API via ``_call_llm_anthropic()``
 - Auto-detected from ``--llm-base-url`` (``anthropic.com`` in URL → Anthropic).
 - 3 retries with exponential backoff on 429/503/OSError.
@@ -89,6 +89,7 @@ from typing import Any
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
+from openai import OpenAI
 
 from cases.models import Case, CaseState, CaseType, DocumentSource, SourceType
 from cases.services.priority_case_loader import filter_by_priority, load_priority_cases
@@ -97,7 +98,7 @@ logger = logging.getLogger(__name__)
 
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 DOWNLOAD_CHUNK_SIZE = 16 * 1024
-DEFAULT_OPENCODE_BASE = "https://opencode.ai/zen/go/v1"
+DEFAULT_OPENCODE_BASE = "https://llm-proxy.jawafdehi.org/v1"
 DEFAULT_LLM_TIMEOUT = 300
 MAX_LLM_RETRIES = 3
 COURT_ORDER_HEAD_CHARS = 12000
@@ -105,6 +106,7 @@ COURT_ORDER_TAIL_CHARS = 6000
 COURT_ORDER_FULL_MAX = 18000  # if ≤ this, send whole doc; else head+tail
 DEVANAGARI_ALPHABETIC_RE = re.compile(r"[ऄ-हक़-ॡ]")
 ALPHABETIC_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+_LLM_PROMPT_SIZE_WARN = 60000
 _CLOUD_METADATA_IP = "169.254.169.254"  # NOSONAR — cloud metadata link-local
 _SSRF_BLOCKED_HOSTNAMES = frozenset(
     {"localhost", "metadata.google.internal", _CLOUD_METADATA_IP, "metadata", "0.0.0.0"}
@@ -310,9 +312,6 @@ EXTRACTED CASE DATA:
 COURT CASE METADATA (from NGM judicial database):
 {court_case_metadata}
 
-ADDITIONAL COURT ORDER TEXTS (for enrichment/verification):
-{court_order_texts}
-
 OUTPUT STRUCTURE:
 
 **क) अभियोगदावीको सार** (MANDATORY)
@@ -487,16 +486,6 @@ def resolve_api_key(cli_key: str | None = None, is_anthropic: bool = False) -> s
     )
 
 
-def _llm_endpoint(base_url: str, model: str) -> str:
-    base = base_url.rstrip("/")
-    # OpenAI-compatible endpoint: some proxies (e.g. opencode.ai) include /v1
-    # in the base URL; others (bare proxy hosts) don't.  Add /v1/ prefix when
-    # the base doesn't already end with a version-segment path.
-    if not re.search(r"/v\d+$", base):
-        return f"{base}/v1/chat/completions"
-    return f"{base}/chat/completions"
-
-
 def _llm_timeout(cli_timeout: int | None = None) -> int:
     if cli_timeout is not None:
         if cli_timeout <= 0:
@@ -536,28 +525,16 @@ def _extract_json_body(raw: str) -> str:
     return raw
 
 
-def _parse_llm_opencode_response(payload: dict) -> str:
-    """Extract response text from a non-streaming completion payload."""
-    choices = payload.get("choices", [])
-    if not choices:
+
+
+def safe_truncate(text: str | None, max_chars: int = 15000) -> str:
+    """Character-safe truncation for Devanagari text.
+    Python str slicing operates on Unicode code points, not bytes,
+    so Devanagari grapheme clusters are preserved correctly.
+    """
+    if not text:
         return ""
-    return choices[0].get("message", {}).get("content", "")
-
-
-def _parse_llm_response_json(raw_text: str) -> dict:
-    """Decode LLM response text into a dict, handling surrounding markdown."""
-    decoder = json.JSONDecoder()
-    idx = 0
-    while idx < len(raw_text):
-        try:
-            obj, end = decoder.raw_decode(raw_text, idx)
-        except json.JSONDecodeError:
-            break
-        if isinstance(obj, dict) and ("choices" in obj or "content" in obj):
-            return obj
-        idx = end
-    # Fallback: try decoding from start
-    return decoder.raw_decode(raw_text)[0]
+    return text[:max_chars]
 
 
 class Command(BaseCommand):
@@ -1298,6 +1275,7 @@ class Command(BaseCommand):
             is_opencode,
             EXTRACTION_SYSTEM_PROMPT,
             prompt,
+            step_tag="extract",
         )
         try:
             extracted_json = json.loads(raw or "")
@@ -1363,25 +1341,6 @@ class Command(BaseCommand):
             )
         else:
             fmt_context["court_case_metadata"] = "(No court case metadata found)"
-        if discovery.get("court_order_texts"):
-            truncated = [t[:5000] for t in discovery["court_order_texts"]]
-            joined = ""
-            total = 0
-            for i, t in enumerate(truncated):
-                header = f"Court Order {i+1}:\n"
-                sep = "\n\n---\n\n" if joined else ""
-                chunk = sep + header + t
-                if total + len(chunk) > 15000:
-                    break
-                joined += chunk
-                total += len(chunk)
-            fmt_context["court_order_texts"] = (
-                joined
-                if joined
-                else "(Truncated — no court order texts within aggregate cap)"
-            )
-        else:
-            fmt_context["court_order_texts"] = "(No additional court order texts)"
 
         fmt_prompt = FORMATTING_USER_PROMPT.format(**fmt_context)
         self.stdout.write("  [2/2] Formatting Markdown overview...")
@@ -1394,6 +1353,7 @@ class Command(BaseCommand):
             is_opencode,
             FORMATTING_SYSTEM_PROMPT,
             fmt_prompt,
+            step_tag="format",
         )
         try:
             formatted = json.loads(raw or "")
@@ -1474,9 +1434,10 @@ class Command(BaseCommand):
     # ── LLM calls ──────────────────────────────────────────────────
 
     def _call_llm(
-        self, model, base_url, api_key, timeout, is_opencode, system_prompt, prompt
+        self, model, base_url, api_key, timeout, is_opencode, system_prompt, prompt,
+        step_tag="LLM",
     ):
-        backend = "opencode" if is_opencode else "anthropic"
+        backend = "stream" if is_opencode else "anthropic"
         logger.info(
             "LLM call: backend=%s model=%s prompt_len=%d timeout=%d",
             backend,
@@ -1485,107 +1446,110 @@ class Command(BaseCommand):
             timeout,
         )
         if is_opencode:
-            return self._call_llm_opencode(
-                model, base_url, api_key, timeout, system_prompt, prompt
+            return self._call_llm_stream(
+                model, base_url, api_key, timeout, system_prompt, prompt, step_tag=step_tag,
             )
         return self._call_llm_anthropic(
             model, base_url, api_key, timeout, system_prompt, prompt
         )
 
-    def _call_llm_opencode(
-        self, model, base_url, api_key, timeout, system_prompt, prompt
+    def _call_llm_stream(
+        self, model, base_url, api_key, timeout, system_prompt, prompt, step_tag="LLM"
     ):
-        endpoint = _llm_endpoint(base_url, model)
-        normalized_model = normalize_model(model)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "JawafdehiAPI/1.0 enrich_case_overview",
-        }
-        body = {
-            "model": normalized_model,
-            "max_tokens": 6000,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.1,
-        }
-        data = json.dumps(body).encode("utf-8")
-        logger.debug(
-            "LLM opencode req: endpoint=%s model=%s prompt_len=%d",
-            endpoint,
-            normalized_model,
-            len(prompt),
+        """Call LLM via OpenAI-compatible proxy with streaming (SDK-based).
+
+        Streaming forces Chunked Transfer Encoding at the HTTP layer,
+        which resets Cloudflare's idle timer and prevents HTTP 524
+        gateway timeouts during long generations.
+        """
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=0,  # handled by our own retry loop
         )
+        total_chars = len(prompt)
+        logger.info(
+            "LLM stream: step=%s model=%s prompt_len=%d timeout=%d",
+            step_tag, model, total_chars, timeout,
+        )
+        if total_chars > _LLM_PROMPT_SIZE_WARN:
+            logger.warning(
+                "LLM stream: step=%s HIGH PAYLOAD WARNING: %d chars (>%d)",
+                step_tag, total_chars, _LLM_PROMPT_SIZE_WARN,
+            )
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         for attempt in range(1, MAX_LLM_RETRIES + 1):
             try:
-                req = urllib.request.Request(
-                    endpoint, data=data, headers=headers, method="POST"
+                start_time = time.time()
+                stream = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True,
+                    temperature=0.1,
+                    max_tokens=6000,
                 )
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    raw_text = resp.read().decode("utf-8")
-                payload = _parse_llm_response_json(raw_text)
-                raw = _parse_llm_opencode_response(payload)
-                response_model = payload.get("model", "")
+                accumulated = ""
+                ttft_recorded = False
+                resolved_model = "unknown"
+                for chunk in stream:
+                    if not ttft_recorded:
+                        ttft = time.time() - start_time
+                        resolved_model = getattr(chunk, "model", "unknown") or "unknown"
+                        logger.info(
+                            "LLM stream: step=%s TTFT=%.2fs resolved_model=%s",
+                            step_tag, ttft, resolved_model,
+                        )
+                        ttft_recorded = True
+                    if chunk.choices and chunk.choices[0].delta.content is not None:
+                        accumulated += chunk.choices[0].delta.content
+
+                total_duration = time.time() - start_time
                 logger.info(
-                    "LLM opencode: attempt %d succeeded — "
-                    "response_len=%d model=%s request_model=%s",
-                    attempt,
-                    len(raw),
-                    response_model,
-                    normalized_model,
+                    "LLM stream: step=%s attempt=%d succeeded "
+                    "gen_time=%.2fs response_len=%d model=%s",
+                    step_tag, attempt, total_duration, len(accumulated), resolved_model,
                 )
-                if not raw.strip():
+
+                if not accumulated.strip():
                     logger.warning(
-                        "LLM opencode: attempt %d — empty response content", attempt
+                        "LLM stream: step=%s attempt=%d — empty response", step_tag, attempt,
                     )
                     if attempt < MAX_LLM_RETRIES:
                         wait = 2**attempt
                         self.stdout.write(
                             self.style.WARNING(
-                                f"  LLM returned empty response on attempt {attempt},"
-                                f" retrying in {wait}s..."
+                                f"  LLM empty response attempt {attempt}, retry in {wait}s..."
                             )
                         )
                         time.sleep(wait)
                         continue
                     raise CommandError(
-                        "LLM returned empty response after "
-                        f"{MAX_LLM_RETRIES} attempts"
+                        f"LLM empty response after {MAX_LLM_RETRIES} attempts"
                     )
-                return _extract_json_body(raw)
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace")
+                return _extract_json_body(accumulated)
+
+            except Exception as exc:
                 logger.warning(
-                    "LLM opencode: attempt %d — HTTP %d: %s",
-                    attempt,
-                    exc.code,
-                    body[:300],
+                    "LLM stream: step=%s attempt=%d — %s: %s",
+                    step_tag, attempt, type(exc).__name__, exc,
                 )
-                if attempt < MAX_LLM_RETRIES and exc.code in (429, 502, 503, 504, 524):
-                    wait = 2 ** (attempt + 1)  # longer backoff for server-side timeouts
-                    self.stdout.write(
-                        self.style.WARNING(
-                            f"  LLM {exc.code} on attempt {attempt}, retrying in {wait}s..."
-                        )
-                    )
-                    time.sleep(wait)
-                    continue
-                raise CommandError(f"LLM HTTP {exc.code}: {body[:300]}") from exc
-            except OSError as exc:
-                logger.warning("LLM opencode: attempt %d — OSError: %s", attempt, exc)
                 if attempt < MAX_LLM_RETRIES:
                     wait = 2**attempt
                     self.stdout.write(
                         self.style.WARNING(
-                            f"  LLM connection error on attempt {attempt}, retrying in {wait}s..."
+                            f"  LLM error on attempt {attempt}, retry in {wait}s..."
                         )
                     )
                     time.sleep(wait)
                     continue
                 raise CommandError(
-                    f"LLM connection failed after {MAX_LLM_RETRIES} attempts: {exc}"
+                    f"LLM call failed after {MAX_LLM_RETRIES} attempts: {exc}"
                 ) from exc
         return None
 
