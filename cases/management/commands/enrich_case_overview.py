@@ -1868,8 +1868,37 @@ class Command(BaseCommand):
             valid = False
 
         # Hard gate: short_description maximum length
-        if len(short_description) > 1000:
-            issues.append("short_description too long (> 1000 chars)")
+        if len(short_description) > 500:
+            issues.append("short_description too long (> 500 chars)")
+            valid = False
+
+        # Hard gate: no raw HTML tags in short_description
+        if re.search(
+            r"<\s*(h[1-6]|table|tr|td|th|div|p|span|br|ul|ol|li|a)\b",
+            short_description,
+            re.IGNORECASE,
+        ):
+            issues.append("Raw HTML tags found in short_description")
+            valid = False
+
+        # Hard gate: no placeholder text in short_description
+        if any(
+            token.lower() in short_description.lower()
+            for token in [
+                "[insert]",
+                "[tbd]",
+                "[todo]",
+                "[draft]",
+                "[अज्ञात]",
+                "[placeholder]",
+                "[n/a]",
+                "[ai-generated]",
+                "[ai generated]",
+                "[add content]",
+                "[to be written]",
+            ]
+        ):
+            issues.append("Placeholder text found in short_description")
             valid = False
 
         # Hard gate: Devanagari ratio ≥80% of alphabetic characters
