@@ -314,6 +314,13 @@ class TestDjangoAdminWorkflows:
             has_view_permission2
         ), "Other contributors should have view permission for unassigned cases"
 
+        has_change_permission2 = admin_instance.has_change_permission(
+            request_contrib2, case
+        )
+        assert (
+            not has_change_permission2
+        ), "Other contributors should NOT have change permission for unassigned cases"
+
     def test_state_transitions_with_validation(self):
         """
         E2E Test: Verify state transitions are validated correctly.
@@ -1003,6 +1010,13 @@ class TestDjangoAdminWorkflows:
         assert (
             has_view_permission_other
         ), "Other contributors should have view permission for unassigned cases"
+
+        has_change_permission_other = admin_instance.has_change_permission(
+            request_other, minimal_case
+        )
+        assert (
+            not has_change_permission_other
+        ), "Other contributors should NOT have change permission for unassigned cases"
 
     def test_new_case_must_be_draft_state(self):
         """

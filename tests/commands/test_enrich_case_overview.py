@@ -309,9 +309,13 @@ class TestSafeRedirectHandler:
     def test_allows_redirect_to_public(self):
         handler = _SafeRedirectHandler()
         req = urllib.request.Request("https://example.com/page")
-        result = handler.redirect_request(
-            req, None, 301, "Moved", {}, "https://example.com/page"
-        )
+        patched_addrinfo = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ]
+        with patch("socket.getaddrinfo", return_value=patched_addrinfo):
+            result = handler.redirect_request(
+                req, None, 301, "Moved", {}, "https://example.com/page"
+            )
         assert result is not None
 
     def test_rejects_non_http_redirect(self):
@@ -2021,8 +2025,8 @@ class TestDiscoverCourtCases:
             return_value=None,
         ) as mock_get:
             cmd._discover_court_cases(case, extracted)
-        # Should attempt lookups for the extracted case number across multiple court identifiers
-        assert mock_get.call_count >= 1
-        # First call should be with the extracted number
-        call_args = [c[0] for c in mock_get.call_args_list]
-        assert any(args[1] == "081-CR-0081" for args in call_args)
+        # Should attempt lookup for the extracted case number (special court only)
+        assert mock_get.call_count == 1
+        court_id, case_num = mock_get.call_args_list[0][0]
+        assert case_num == "081-CR-0081"
+        assert court_id == "special"
