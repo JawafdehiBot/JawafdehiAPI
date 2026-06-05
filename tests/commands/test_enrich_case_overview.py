@@ -890,12 +890,19 @@ class TestProcessCaseFormatting:
 
         extraction_json = {"accused_persons": []}
 
+        call_count = [0]
         with (
             patch.object(cmd, "_convert_one_source", return_value="test content" * 10),
             patch.object(cmd, "_call_llm") as mock_llm,
             patch.object(cmd.stdout, "write"),
+            patch("time.sleep", return_value=None),
         ):
-            mock_llm.side_effect = [json.dumps(extraction_json), "not valid json {{{"]
+            def llm_side_effect(*args, **kwargs):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return json.dumps(extraction_json)  # extraction
+                return "not valid json {{{"  # format (+ retries)
+            mock_llm.side_effect = llm_side_effect
             cmd._process_case(
                 case,
                 "claude-sonnet-4-5",
@@ -1322,6 +1329,7 @@ class TestErrorHandling:
         with (
             patch.object(cmd, "_convert_one_source", return_value="test content " * 10),
             patch.object(cmd, "_call_llm", return_value="not json at all {{{"),
+            patch("time.sleep", return_value=None),
         ):
             cmd._process_case(
                 case,
@@ -1351,6 +1359,7 @@ class TestErrorHandling:
         with (
             patch.object(cmd, "_convert_one_source", return_value="test content " * 10),
             patch.object(cmd, "_call_llm", return_value="[1, 2, 3]"),
+            patch("time.sleep", return_value=None),
         ):
             cmd._process_case(
                 case,

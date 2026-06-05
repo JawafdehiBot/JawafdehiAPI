@@ -1273,20 +1273,36 @@ class Command(BaseCommand):
             len(source_texts["court_orders"]),
         )
 
-        raw = self._call_llm(
-            model,
-            base_url,
-            api_key,
-            timeout,
-            is_opencode,
-            EXTRACTION_SYSTEM_PROMPT,
-            prompt,
-            step_tag="extract",
-        )
-        try:
-            extracted_json = json.loads(raw or "")
-        except json.JSONDecodeError:
-            extracted_json = None
+        # Extract step with JSON-parse retry
+        extracted_json = None
+        _MAX_PARSE_RETRIES = 3
+        for parse_attempt in range(1, _MAX_PARSE_RETRIES + 1):
+            raw = self._call_llm(
+                model,
+                base_url,
+                api_key,
+                timeout,
+                is_opencode,
+                EXTRACTION_SYSTEM_PROMPT,
+                prompt,
+                step_tag="extract",
+            )
+            try:
+                extracted_json = json.loads(raw or "")
+            except json.JSONDecodeError:
+                extracted_json = None
+            if isinstance(extracted_json, dict):
+                break
+            logger.warning(
+                "Case %s: step=extract status=parse_retry attempt=%d/%d raw_len=%d",
+                case.case_id, parse_attempt, _MAX_PARSE_RETRIES, len(raw or ""),
+            )
+            self.stdout.write(
+                self.style.WARNING(
+                    f"  Extraction parse failed attempt {parse_attempt}, retrying..."
+                )
+            )
+            time.sleep(1)  # brief pause before re-request
         if not isinstance(extracted_json, dict):
             self.stats["llm_extraction_failures"] += 1
             self.stats["cases_failed"] += 1
@@ -1356,20 +1372,36 @@ class Command(BaseCommand):
         fmt_prompt = FORMATTING_USER_PROMPT.format(**fmt_context)
         self.stdout.write("  [2/2] Formatting Markdown overview...")
         logger.info("Case %s: step=format status=calling", case.case_id)
-        raw = self._call_llm(
-            model,
-            base_url,
-            api_key,
-            timeout,
-            is_opencode,
-            FORMATTING_SYSTEM_PROMPT,
-            fmt_prompt,
-            step_tag="format",
-        )
-        try:
-            formatted = json.loads(raw or "")
-        except json.JSONDecodeError:
-            formatted = None
+
+        # Format step with JSON-parse retry
+        formatted = None
+        for parse_attempt in range(1, _MAX_PARSE_RETRIES + 1):
+            raw = self._call_llm(
+                model,
+                base_url,
+                api_key,
+                timeout,
+                is_opencode,
+                FORMATTING_SYSTEM_PROMPT,
+                fmt_prompt,
+                step_tag="format",
+            )
+            try:
+                formatted = json.loads(raw or "")
+            except json.JSONDecodeError:
+                formatted = None
+            if isinstance(formatted, dict):
+                break
+            logger.warning(
+                "Case %s: step=format status=parse_retry attempt=%d/%d raw_len=%d",
+                case.case_id, parse_attempt, _MAX_PARSE_RETRIES, len(raw or ""),
+            )
+            self.stdout.write(
+                self.style.WARNING(
+                    f"  Format parse failed attempt {parse_attempt}, retrying..."
+                )
+            )
+            time.sleep(1)  # brief pause before re-request
         if not isinstance(formatted, dict):
             self.stats["llm_formatting_failures"] += 1
             self.stats["cases_failed"] += 1
