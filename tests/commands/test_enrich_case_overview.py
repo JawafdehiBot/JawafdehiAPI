@@ -34,7 +34,6 @@ from cases.management.commands.enrich_case_overview import (
     _has_ngm_store_url,
     _has_press_release_keywords,
     _is_direct_document_url,
-    _llm_endpoint,
     _llm_timeout,
     _SafeRedirectHandler,
     _sanitize_download_filename,
@@ -673,10 +672,34 @@ class TestNormalizeBaseUrl:
         assert result == "https://example.com/api"
 
 
-class TestLlmEndpoint:
-    def test_standard_model_uses_chat_completions(self):
-        url = _llm_endpoint("https://api.example.com", "claude-sonnet-4-5")
-        assert url.endswith("/chat/completions")
+
+class TestSafeTruncate:
+    def test_truncates_long_text(self):
+        from cases.management.commands.enrich_case_overview import safe_truncate
+        text = "घ" * 20000
+        result = safe_truncate(text, max_chars=100)
+        assert len(result) == 100
+
+    def test_preserves_short_text(self):
+        from cases.management.commands.enrich_case_overview import safe_truncate
+        text = "प्रस्तुत मुद्दामा"
+        result = safe_truncate(text, max_chars=15000)
+        assert result == text
+
+    def test_handles_none(self):
+        from cases.management.commands.enrich_case_overview import safe_truncate
+        assert safe_truncate(None) == ""
+
+    def test_handles_empty(self):
+        from cases.management.commands.enrich_case_overview import safe_truncate
+        assert safe_truncate("") == ""
+
+    def test_preserves_devanagari_graphemes(self):
+        # Python str slicing preserves Unicode code points
+        from cases.management.commands.enrich_case_overview import safe_truncate
+        text = "अभियोगपत्र"  # 10 Unicode code points
+        result = safe_truncate(text, max_chars=5)
+        assert len(result) == 5
 
 
 class TestLlmTimeout:
@@ -1213,68 +1236,76 @@ class TestPipelineIntegration:
 
 @pytest.mark.django_db
 class TestErrorHandling:
-    def test_llm_call_retries_on_429(self):
+    def _mock_chunk(self, content: str, model: str = "claude-3.5-sonnet"):
+        """Build a mock OpenAI stream chunk."""
+        chunk = MagicMock()
+        chunk.model = model
+        choice = MagicMock()
+        choice.delta.content = content
+        chunk.choices = [choice]
+        return chunk
+
+    def test_llm_call_retries_on_exception(self):
         cmd = Command()
+        call_count = [0]
 
-        class FakeResponse:
-            def read(self):
-                return b"rate limited"
+        def mock_create(*args, **kwargs):
+            call_count[0] += 1
+            raise Exception("server error")
 
-            def close(self):
-                pass
+        with (
+            patch(
+                "cases.management.commands.enrich_case_overview.OpenAI",
+            ) as mock_client_cls,
+            patch("time.sleep", return_value=None),
+        ):
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = mock_create
+            mock_client_cls.return_value = mock_client
+            with pytest.raises(CommandError, match="LLM call failed"):
+                cmd._call_llm_stream(
+                    "claude-sonnet-4-5",
+                    "https://api.example.com",
+                    "key",
+                    5,
+                    "system",
+                    "prompt",
+                )
 
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_urlopen.side_effect = [
-                urllib.error.HTTPError(
-                    "url", 429, "Too Many Requests", {}, FakeResponse()
-                ),
-                urllib.error.HTTPError(
-                    "url", 429, "Too Many Requests", {}, FakeResponse()
-                ),
-                urllib.error.HTTPError(
-                    "url", 429, "Too Many Requests", {}, FakeResponse()
-                ),
-            ]
+        assert call_count[0] == 3
 
-            with patch("time.sleep", return_value=None):
-                with pytest.raises(CommandError, match="LLM HTTP 429"):
-                    cmd._call_llm_opencode(
-                        "claude-sonnet-4-5",
-                        "https://api.example.com",
-                        "key",
-                        5,
-                        "system",
-                        "prompt",
-                    )
-
-            assert mock_urlopen.call_count == 3
-
-    def test_llm_call_raises_after_max_retries(self):
+    def test_llm_call_retries_on_empty_and_succeeds(self):
         cmd = Command()
+        call_count = [0]
 
-        class FakeResponse:
-            def read(self):
-                return b"server error"
+        def mock_create(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 2:
+                return iter([])  # empty stream
+            return iter([
+                self._mock_chunk('{"result": "ok"}', model="claude-3.5-sonnet"),
+            ])
 
-            def close(self):
-                pass
-
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            mock_urlopen.side_effect = urllib.error.HTTPError(
-                "url", 503, "Service Unavailable", {}, FakeResponse()
+        with (
+            patch(
+                "cases.management.commands.enrich_case_overview.OpenAI",
+            ) as mock_client_cls,
+            patch("time.sleep", return_value=None),
+        ):
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = mock_create
+            mock_client_cls.return_value = mock_client
+            result = cmd._call_llm_stream(
+                "claude-sonnet-4-5",
+                "https://api.example.com",
+                "key",
+                5,
+                "system",
+                "prompt",
             )
-            with patch("time.sleep", return_value=None):
-                with pytest.raises(CommandError, match="LLM HTTP 503"):
-                    cmd._call_llm_opencode(
-                        "claude-sonnet-4-5",
-                        "https://api.example.com",
-                        "key",
-                        5,
-                        "system",
-                        "prompt",
-                    )
 
-            assert mock_urlopen.call_count == 3
+        assert json.loads(result) == {"result": "ok"}
+        assert call_count[0] == 2
 
     def test_llm_call_handles_extraction_json_parse_failure(self):
         source = _make_source(
@@ -1333,33 +1364,35 @@ class TestErrorHandling:
 
         assert cmd.stats["llm_extraction_failures"] == 1
 
-    def test_llm_call_retries_on_oserror(self):
+    def test_llm_call_empty_stream_then_success(self):
         cmd = Command()
         call_count = [0]
 
-        def mock_urlopen(*args, **kwargs):
+        def mock_create(*args, **kwargs):
             call_count[0] += 1
             if call_count[0] < 2:
-                raise OSError("connection refused")
-            response = MagicMock()
-            response.__enter__ = MagicMock(return_value=response)
-            response.__exit__ = MagicMock(return_value=False)
-            response.read.return_value = json.dumps(
-                {"choices": [{"message": {"content": '{"result": "ok"}'}}]}
-            ).encode()
-            response.status = 200
-            return response
+                return iter([])
+            return iter([
+                self._mock_chunk('{"result": "ok"}'),
+            ])
 
-        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
-            with patch("time.sleep", return_value=None):
-                result = cmd._call_llm_opencode(
-                    "claude-sonnet-4-5",
-                    "https://api.example.com",
-                    "key",
-                    5,
-                    "system",
-                    "prompt",
-                )
+        with (
+            patch(
+                "cases.management.commands.enrich_case_overview.OpenAI",
+            ) as mock_client_cls,
+            patch("time.sleep", return_value=None),
+        ):
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = mock_create
+            mock_client_cls.return_value = mock_client
+            result = cmd._call_llm_stream(
+                "claude-sonnet-4-5",
+                "https://api.example.com",
+                "key",
+                5,
+                "system",
+                "prompt",
+            )
 
         assert call_count[0] == 2
         assert json.loads(result) == {"result": "ok"}
@@ -1412,38 +1445,45 @@ class TestErrorHandling:
         assert gathered["charge_sheet"] is None
         assert len(gathered["other_docs"]) == 1
 
-    def test_call_llm_opencode_empty_choices_before_success(self):
+    def test_llm_call_stream_tags_emit_logs(self):
+        """Verify TTFT, model identity, and duration are logged during streaming."""
         cmd = Command()
-        call_count = [0]
 
-        def mock_urlopen(*args, **kwargs):
-            call_count[0] += 1
-            response = MagicMock()
-            response.__enter__ = MagicMock(return_value=response)
-            response.__exit__ = MagicMock(return_value=False)
-            if call_count[0] < 2:
-                response.read.return_value = json.dumps({"choices": []}).encode()
-                response.status = 200
-            else:
-                response.read.return_value = json.dumps(
-                    {"choices": [{"message": {"content": '{"result": "ok"}'}}]}
-                ).encode()
-                response.status = 200
-            return response
+        def mock_create(*args, **kwargs):
+            return iter([
+                self._mock_chunk("part1 ", model="claude-3.5-sonnet"),
+                self._mock_chunk("part2", model="claude-3.5-sonnet"),
+            ])
 
-        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
-            with patch("time.sleep", return_value=None):
-                result = cmd._call_llm_opencode(
-                    "claude-sonnet-4-5",
-                    "https://api.example.com",
-                    "key",
-                    5,
-                    "system",
-                    "prompt",
-                )
+        with (
+            patch(
+                "cases.management.commands.enrich_case_overview.OpenAI",
+            ) as mock_client_cls,
+            patch("cases.management.commands.enrich_case_overview.logger") as mock_logger,
+        ):
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = mock_create
+            mock_client_cls.return_value = mock_client
+            result = cmd._call_llm_stream(
+                "claude-sonnet-4-5",
+                "https://api.example.com",
+                "key",
+                5,
+                "system",
+                "prompt",
+                step_tag="test-step",
+            )
 
-        assert json.loads(result) == {"result": "ok"}
-        assert call_count[0] == 2
+        assert result == "part1 part2"
+        # Verify TTFT and model identity were logged
+        ttft_messages = [
+            c for c in mock_logger.info.call_args_list
+            if "TTFT" in str(c)
+        ]
+        assert len(ttft_messages) >= 1
+        logged_text = str(ttft_messages[0])
+        assert "test-step" in logged_text
+        assert "claude-3.5-sonnet" in logged_text
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
