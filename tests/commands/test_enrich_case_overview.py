@@ -13,6 +13,7 @@ Groups:
 """
 
 import json
+import socket
 import tempfile
 import urllib.error
 import urllib.parse
@@ -126,8 +127,10 @@ class TestValidateHostSafety:
                 _validate_host_safety(host)
 
     def test_allows_public_host(self):
-        _validate_host_safety("example.com")
-        _validate_host_safety("ciaa.gov.np")
+        patched_addrinfo = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+        with patch("socket.getaddrinfo", return_value=patched_addrinfo):
+            _validate_host_safety("example.com")
+            _validate_host_safety("ciaa.gov.np")
 
     def test_none_hostname_raises(self):
         with pytest.raises(ValueError, match="hostname is None"):
