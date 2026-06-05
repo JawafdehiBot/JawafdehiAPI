@@ -352,6 +352,9 @@ EXTRACTED CASE DATA:
 COURT CASE METADATA (from NGM judicial database):
 {court_case_metadata}
 
+DISCOVERED COURT ORDER TEXTS (from NGM document store):
+{court_order_discovery_texts}
+
 OUTPUT STRUCTURE:
 
 **क) अभियोगदावीको सार** (MANDATORY)
@@ -514,15 +517,20 @@ def resolve_api_key(cli_key: str | None = None, is_anthropic: bool = False) -> s
     env_vars = (
         ("ANTHROPIC_API_KEY", "JAWAFDEHI_LLM_API_KEY", "OPENCODE_API_KEY")
         if is_anthropic
-        else ("JAWAFDEHI_LLM_API_KEY", "OPENCODE_API_KEY", "ANTHROPIC_API_KEY")
+        else ("JAWAFDEHI_LLM_API_KEY", "OPENCODE_API_KEY")
     )
     for env_var in env_vars:
         val = os.environ.get(env_var)
         if val:
             return val
+    if is_anthropic:
+        raise CommandError(
+            "No API key provided. Set --llm-api-key, JAWAFDEHI_LLM_API_KEY, "
+            "OPENCODE_API_KEY, or ANTHROPIC_API_KEY."
+        )
     raise CommandError(
         "No API key provided. Set --llm-api-key, JAWAFDEHI_LLM_API_KEY, "
-        "OPENCODE_API_KEY, or ANTHROPIC_API_KEY."
+        "or OPENCODE_API_KEY."
     )
 
 
@@ -1087,9 +1095,8 @@ class Command(BaseCommand):
                 normalized = normalize_case_number(raw_num)
             except ValueError:
                 continue
-            # Try common court identifiers
-            for court_id in ("special", "supreme", "high", "district"):
-                case_numbers_to_lookup.add((court_id, normalized))
+            # CIAA Special Court pipeline: only "special" court entries are relevant
+            case_numbers_to_lookup.add(("special", normalized))
 
         if not case_numbers_to_lookup:
             logger.debug("Case %s: no court case numbers to look up", case.case_id)
@@ -1611,6 +1618,17 @@ class Command(BaseCommand):
             )
         else:
             fmt_context["court_case_metadata"] = "(No court case metadata found)"
+        # Include court-order texts discovered after extraction so the
+        # formatter can reference them alongside already-converted sources.
+        court_order_texts = discovery.get("court_order_texts", [])
+        fmt_context["court_order_discovery_texts"] = (
+            "\n\n---\n\n".join(
+                f"Discovered Court Order {i+1}:\n{t[:8000]}"
+                for i, t in enumerate(court_order_texts)
+            )
+            if court_order_texts
+            else "(No additional court order texts discovered)"
+        )
 
         fmt_prompt = FORMATTING_USER_PROMPT.format(**fmt_context)
         self.stdout.write("  [2/2] Formatting Markdown overview...")
@@ -1711,8 +1729,27 @@ class Command(BaseCommand):
             return
 
         case.short_description = short_description
+        if not force:
+            # Re-read description from DB — it may have been populated by another
+            # process during the LLM call window (30-60+ s). Skip overwrite if so.
+            fresh = Case.objects.filter(pk=case.pk).values_list("description", flat=True).first()
+            if fresh:
+                logger.info(
+                    "Case %s: description was populated concurrently — preserving",
+                    case.case_id,
+                )
+                case.description = fresh
+                self.stats["cases_enriched"] += 1
+                self.stdout.write(
+                    self.style.WARNING(
+                        "  SKIPPED description: overwritten concurrently by another process"
+                    )
+                )
+                case.save(update_fields=["short_description", "updated_at"])
+                return
         if not case.description or force:
             case.description = description
+
         case.save(update_fields=["short_description", "description", "updated_at"])
         self.stats["cases_enriched"] += 1
         logger.info(
