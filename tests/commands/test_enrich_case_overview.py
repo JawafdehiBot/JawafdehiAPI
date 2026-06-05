@@ -31,6 +31,7 @@ from cases.management.commands.enrich_case_overview import (
     _copy_stream_to_path_with_limit,
     _extract_json_body,
     _has_charge_sheet_keywords,
+    _has_court_order_keywords,
     _has_ngm_store_url,
     _has_press_release_keywords,
     _is_direct_document_url,
@@ -341,6 +342,54 @@ class TestGatherCaseSources:
 
         gathered = cmd._gather_case_sources(case)
         assert len(gathered["court_orders"]) == 1
+
+    def test_official_govt_with_court_order_keywords_routes_to_court_orders(self):
+        """OFFICIAL_GOVERNMENT source with court order keywords → court_orders."""
+        source = _make_source(
+            "src-co-002",
+            "फैसला — विशेष अदालत",
+            SourceType.OFFICIAL_GOVERNMENT,
+        )
+        case = _make_case(evidence=[{"source_id": source.source_id}])
+        cmd = self._make_cmd_with_cache([source])
+
+        gathered = cmd._gather_case_sources(case)
+        assert gathered["charge_sheet"] is None
+        assert len(gathered["court_orders"]) == 1
+        assert gathered["court_orders"][0].source_id == "src-co-002"
+        assert len(gathered["other_docs"]) == 0
+
+    def test_legal_procedural_with_court_order_keywords_routes_to_court_orders(self):
+        """LEGAL_PROCEDURAL source with court order keywords → court_orders."""
+        source = _make_source(
+            "src-co-003",
+            "Court Order — आदेश",
+            SourceType.LEGAL_PROCEDURAL,
+        )
+        case = _make_case(evidence=[{"source_id": source.source_id}])
+        cmd = self._make_cmd_with_cache([source])
+
+        gathered = cmd._gather_case_sources(case)
+        assert len(gathered["court_orders"]) == 1
+        assert gathered["court_orders"][0].source_id == "src-co-003"
+        assert len(gathered["procedural_docs"]) == 0
+
+    def test_official_govt_court_order_not_overridden_by_charge_sheet(self):
+        """OFFICIAL_GOVERNMENT court order is separate from charge_sheet slot."""
+        co = _make_source("src-co-004", "फैसला", SourceType.OFFICIAL_GOVERNMENT)
+        cs = _make_source("src-cs-002", "अभियोगपत्र", SourceType.OFFICIAL_GOVERNMENT)
+        case = _make_case(
+            evidence=[
+                {"source_id": co.source_id},
+                {"source_id": cs.source_id},
+            ]
+        )
+        cmd = self._make_cmd_with_cache([co, cs])
+
+        gathered = cmd._gather_case_sources(case)
+        assert gathered["charge_sheet"].source_id == "src-cs-002"
+        assert len(gathered["court_orders"]) == 1
+        assert gathered["court_orders"][0].source_id == "src-co-004"
 
     def test_categorizes_investigative_reports(self):
         source = _make_source(
@@ -672,31 +721,35 @@ class TestNormalizeBaseUrl:
         assert result == "https://example.com/api"
 
 
-
 class TestSafeTruncate:
     def test_truncates_long_text(self):
         from cases.management.commands.enrich_case_overview import safe_truncate
+
         text = "घ" * 20000
         result = safe_truncate(text, max_chars=100)
         assert len(result) == 100
 
     def test_preserves_short_text(self):
         from cases.management.commands.enrich_case_overview import safe_truncate
+
         text = "प्रस्तुत मुद्दामा"
         result = safe_truncate(text, max_chars=15000)
         assert result == text
 
     def test_handles_none(self):
         from cases.management.commands.enrich_case_overview import safe_truncate
+
         assert safe_truncate(None) == ""
 
     def test_handles_empty(self):
         from cases.management.commands.enrich_case_overview import safe_truncate
+
         assert safe_truncate("") == ""
 
     def test_preserves_devanagari_graphemes(self):
         # Python str slicing preserves Unicode code points
         from cases.management.commands.enrich_case_overview import safe_truncate
+
         text = "अभियोगपत्र"  # 10 Unicode code points
         result = safe_truncate(text, max_chars=5)
         assert len(result) == 5
@@ -897,11 +950,13 @@ class TestProcessCaseFormatting:
             patch.object(cmd.stdout, "write"),
             patch("time.sleep", return_value=None),
         ):
+
             def llm_side_effect(*args, **kwargs):
                 call_count[0] += 1
                 if call_count[0] == 1:
                     return json.dumps(extraction_json)  # extraction
                 return "not valid json {{{"  # format (+ retries)
+
             mock_llm.side_effect = llm_side_effect
             cmd._process_case(
                 case,
@@ -1289,9 +1344,11 @@ class TestErrorHandling:
             call_count[0] += 1
             if call_count[0] < 2:
                 return iter([])  # empty stream
-            return iter([
-                self._mock_chunk('{"result": "ok"}', model="claude-3.5-sonnet"),
-            ])
+            return iter(
+                [
+                    self._mock_chunk('{"result": "ok"}', model="claude-3.5-sonnet"),
+                ]
+            )
 
         with (
             patch(
@@ -1381,9 +1438,11 @@ class TestErrorHandling:
             call_count[0] += 1
             if call_count[0] < 2:
                 return iter([])
-            return iter([
-                self._mock_chunk('{"result": "ok"}'),
-            ])
+            return iter(
+                [
+                    self._mock_chunk('{"result": "ok"}'),
+                ]
+            )
 
         with (
             patch(
@@ -1459,16 +1518,20 @@ class TestErrorHandling:
         cmd = Command()
 
         def mock_create(*args, **kwargs):
-            return iter([
-                self._mock_chunk("part1 ", model="claude-3.5-sonnet"),
-                self._mock_chunk("part2", model="claude-3.5-sonnet"),
-            ])
+            return iter(
+                [
+                    self._mock_chunk("part1 ", model="claude-3.5-sonnet"),
+                    self._mock_chunk("part2", model="claude-3.5-sonnet"),
+                ]
+            )
 
         with (
             patch(
                 "cases.management.commands.enrich_case_overview.OpenAI",
             ) as mock_client_cls,
-            patch("cases.management.commands.enrich_case_overview.logger") as mock_logger,
+            patch(
+                "cases.management.commands.enrich_case_overview.logger"
+            ) as mock_logger,
         ):
             mock_client = MagicMock()
             mock_client.chat.completions.create = mock_create
@@ -1485,10 +1548,7 @@ class TestErrorHandling:
 
         assert result == "part1 part2"
         # Verify TTFT and model identity were logged
-        ttft_messages = [
-            c for c in mock_logger.info.call_args_list
-            if "TTFT" in str(c)
-        ]
+        ttft_messages = [c for c in mock_logger.info.call_args_list if "TTFT" in str(c)]
         assert len(ttft_messages) >= 1
         logged_text = str(ttft_messages[0])
         assert "test-step" in logged_text
@@ -1556,6 +1616,38 @@ class TestHasPressReleaseKeywords:
     def test_handles_none_description(self):
         source = DocumentSource(title="Press Release", description=None)
         assert _has_press_release_keywords(source) is True
+
+
+class TestHasCourtOrderKeywords:
+    def test_detects_english_keyword(self):
+        source = DocumentSource(title="Court Order — Special Court", description="")
+        assert _has_court_order_keywords(source) is True
+
+    def test_detects_nepali_faisala(self):
+        source = DocumentSource(title="फैसला — विशेष अदालत", description="")
+        assert _has_court_order_keywords(source) is True
+
+    def test_detects_nepali_aadesh(self):
+        source = DocumentSource(title="आदेश", description="")
+        assert _has_court_order_keywords(source) is True
+
+    def test_detects_nepali_nirnaya(self):
+        source = DocumentSource(title="निर्णय", description="")
+        assert _has_court_order_keywords(source) is True
+
+    def test_matches_in_description(self):
+        source = DocumentSource(
+            title="Supreme Court Doc", description="Final verdict decision"
+        )
+        assert _has_court_order_keywords(source) is True
+
+    def test_returns_false_for_press_release(self):
+        source = DocumentSource(title="Press Release", description="प्रेस विज्ञप्ति")
+        assert _has_court_order_keywords(source) is False
+
+    def test_handles_none_description(self):
+        source = DocumentSource(title="Court Order", description=None)
+        assert _has_court_order_keywords(source) is True
 
 
 class TestHasNgmStoreUrl:
