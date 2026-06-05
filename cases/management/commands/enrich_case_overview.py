@@ -109,6 +109,7 @@ COURT_ORDER_FULL_MAX = 18000  # if ≤ this, send whole doc; else head+tail
 CHUNK_SIZE = 15000  # chars per chunk for map-reduce
 CHUNK_OVERLAP = 1000  # overlap between adjacent chunks
 _MAX_PARSE_RETRIES = 3  # retries for JSON parse failures in LLM response
+_MAP_REDUCE_CONCURRENCY = 3  # max concurrent async chunk extractions
 DEVANAGARI_ALPHABETIC_RE = re.compile(r"[ऄ-हक़-ॡ]")
 ALPHABETIC_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 _LLM_PROMPT_SIZE_WARN = 60000
@@ -596,6 +597,19 @@ def chunk_document_text(
             break
         start += chunk_size - overlap
     return chunks
+
+
+class ExtractionFailed(Exception):
+    """Fatal chunk extraction failure — abort map-reduce for this case."""
+
+
+def sanitize_nepali_text(text: str) -> str:
+    """Remove PDF extraction artifacts before LLM processing."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\?{2,}", "", text)
+    cleaned = cleaned.replace("‌", "").replace("‍", "")
+    return cleaned
 
 
 class Command(BaseCommand):
@@ -1180,7 +1194,10 @@ class Command(BaseCommand):
         api_key: str,
         timeout: int,
     ) -> dict:
-        """Extract structured data from a single chunk via AsyncOpenAI."""
+        """Extract structured data from a single chunk via AsyncOpenAI.
+
+        Raises ExtractionFailed if all retries exhausted — caller must abort.
+        """
         prompt = CHUNK_EXTRACTION_PROMPT.format(
             chunk_index=chunk_index + 1,
             total_chunks=total_chunks,
@@ -1216,7 +1233,9 @@ class Command(BaseCommand):
                 )
                 if attempt < 3:
                     await asyncio.sleep(2**attempt)
-        return {}
+        raise ExtractionFailed(
+            f"Chunk {chunk_index + 1}/{total_chunks} ({doc_type}) failed after 3 attempts"
+        )
 
     def _run_map_reduce(
         self,
@@ -1226,9 +1245,11 @@ class Command(BaseCommand):
         api_key: str,
         timeout: int,
     ) -> dict | None:
-        """Orchestrate map-reduce: chunk sources → parallel async extraction → merge.
+        """Orchestrate map-reduce: sanitize → chunk → semaphore-throttled async extraction → merge.
 
-        Returns merged JSON dict, or None if no chunks could be processed.
+        Throttled to ``_MAP_REDUCE_CONCURRENCY`` concurrent LLM calls.
+        Raises ExtractionFailed upward if any chunk permanently fails —
+        caller must abort the case to prevent empty/hallucinated overviews.
         """
         chunks = []
         for doc_type in (
@@ -1238,17 +1259,23 @@ class Command(BaseCommand):
             "financial_docs",
         ):
             for text in source_texts.get(doc_type) or []:
-                chunks.extend(chunk_document_text(text))
+                clean = sanitize_nepali_text(text)
+                chunks.extend(chunk_document_text(clean))
 
         if not chunks:
             logger.warning("No chunks produced from source texts")
             return None
 
-        logger.info("Map-reduce: %d chunks from source texts", len(chunks))
+        logger.info(
+            "Map-reduce: %d chunks, concurrency=%d",
+            len(chunks),
+            _MAP_REDUCE_CONCURRENCY,
+        )
+        semaphore = asyncio.Semaphore(_MAP_REDUCE_CONCURRENCY)
 
-        async def _run():
-            tasks = [
-                self._extract_chunk_async(
+        async def _fetch(i: int, chunk: str) -> dict:
+            async with semaphore:
+                return await self._extract_chunk_async(
                     chunk_text=chunk,
                     doc_type="court order / evidence document",
                     chunk_index=i,
@@ -1258,15 +1285,18 @@ class Command(BaseCommand):
                     api_key=api_key,
                     timeout=timeout,
                 )
-                for i, chunk in enumerate(chunks)
-            ]
+
+        async def _run():
+            tasks = [_fetch(i, chunk) for i, chunk in enumerate(chunks)]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             parsed = []
             for r in results:
                 if isinstance(r, dict):
                     parsed.append(r)
+                elif isinstance(r, ExtractionFailed):
+                    raise r  # fail-fast for the case
                 elif isinstance(r, Exception):
-                    logger.warning("Chunk extraction raised: %s", r)
+                    logger.warning("Chunk extraction raised unexpected: %s", r)
             logger.info("Map-reduce: %d/%d chunks succeeded", len(parsed), len(chunks))
             return self._merge_chunk_extractions(parsed)
 
@@ -1373,9 +1403,24 @@ class Command(BaseCommand):
                 len(source_texts["press_releases"]),
                 len(source_texts["court_orders"]),
             )
-            extracted_json = self._run_map_reduce(
-                source_texts, model, base_url, api_key, timeout
-            )
+            try:
+                extracted_json = self._run_map_reduce(
+                    source_texts, model, base_url, api_key, timeout
+                )
+            except ExtractionFailed as exc:
+                self.stats["llm_extraction_failures"] += 1
+                self.stats["cases_failed"] += 1
+                logger.error(
+                    "Case %s: step=extract status=failed reason=chunk_fatal %s",
+                    case.case_id,
+                    exc,
+                )
+                self.stdout.write(
+                    self.style.ERROR(
+                        f"  FAILED: Map-reduce chunk extraction fatal — {exc}"
+                    )
+                )
+                return
             if not isinstance(extracted_json, dict) or not extracted_json:
                 self.stats["llm_extraction_failures"] += 1
                 self.stats["cases_failed"] += 1
