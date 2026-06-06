@@ -1732,7 +1732,11 @@ class Command(BaseCommand):
         if not force:
             # Re-read description from DB — it may have been populated by another
             # process during the LLM call window (30-60+ s). Skip overwrite if so.
-            fresh = Case.objects.filter(pk=case.pk).values_list("description", flat=True).first()
+            fresh = (
+                Case.objects.filter(pk=case.pk)
+                .values_list("description", flat=True)
+                .first()
+            )
             if fresh:
                 logger.info(
                     "Case %s: description was populated concurrently — preserving",
