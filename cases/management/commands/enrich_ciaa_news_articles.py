@@ -78,6 +78,11 @@ class Command(BaseCommand):
             help="Maximum articles per case (default: 5)",
         )
         parser.add_argument(
+            "--skip-partial",
+            action="store_true",
+            help="Skip cases that already have 1+ MEDIA_NEWS evidence entries",
+        )
+        parser.add_argument(
             "--verbose",
             action="store_true",
             help="Enable verbose debug logging",
@@ -194,6 +199,7 @@ class Command(BaseCommand):
         priority = options["priority"]
         all_cases_flag = options.get("all_cases")
         force = options["force"]
+        skip_partial = options.get("skip_partial", False)
         limit = options.get("limit")
         max_articles = options.get("max_articles", 5)
         verbose = options.get("verbose")
@@ -264,6 +270,7 @@ class Command(BaseCommand):
             cases=cases.iterator(),
             dry_run=dry_run,
             force=force,
+            skip_partial=skip_partial,
         )
 
         self._print_summary(stats, dry_run)

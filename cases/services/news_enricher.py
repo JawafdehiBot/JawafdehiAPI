@@ -1039,6 +1039,7 @@ class NewsEnricher:
         case: Case,
         dry_run: bool = False,
         force: bool = False,
+        skip_partial: bool = False,
         case_num: int = 0,
         total_cases: int = 0,
     ) -> dict:
@@ -1059,6 +1060,9 @@ class NewsEnricher:
 
         if self._is_already_saturated(case, force):
             return self._make_stats("skipped", "already_saturated")
+
+        if self._is_partial_skip(case, skip_partial, force):
+            return self._make_stats("skipped", "skip_partial")
 
         press_release_text = self._get_press_release_content(case)
         if press_release_text:
@@ -1121,6 +1125,23 @@ class NewsEnricher:
                 "  Already has %d MEDIA_NEWS evidence entries (max=%d) — skipping",
                 current_media_news_count,
                 self.max_articles_per_case,
+            )
+            return True
+        return False
+
+    def _is_partial_skip(self, case: Case, skip_partial: bool, force: bool) -> bool:
+        """Check if case should be skipped via --skip-partial.
+
+        When active, skip any case with ≥1 existing MEDIA_NEWS evidence entry.
+        The force flag overrides this check.
+        """
+        if not skip_partial or force:
+            return False
+        count = self._count_media_news_evidence(case)
+        if count > 0:
+            logger.info(
+                "  Already has %d MEDIA_NEWS evidence entries — skipping (skip_partial)",
+                count,
             )
             return True
         return False
@@ -2670,6 +2691,7 @@ def enrich_cases_batch(
     cases,
     dry_run: bool = False,
     force: bool = False,
+    skip_partial: bool = False,
 ) -> dict:
     """Enrich multiple cases and return aggregate stats."""
     stats = {
@@ -2701,6 +2723,7 @@ def enrich_cases_batch(
                 case,
                 dry_run=dry_run,
                 force=force,
+                skip_partial=skip_partial,
                 case_num=idx,
                 total_cases=total,
             )
