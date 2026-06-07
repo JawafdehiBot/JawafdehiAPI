@@ -788,6 +788,8 @@ class Command(BaseCommand):
         )
 
     def _get_eligible_cases(self, limit, force, case_id, priority=False):
+        # CIAA cohort: only cases imported with a "special:*" court-case ref
+        # (see import_ciaa_cases). Non-CIAA CORRUPTION draft cases out of scope.
         queryset = Case.objects.filter(
             state=CaseState.DRAFT, case_type=CaseType.CORRUPTION
         )
@@ -809,7 +811,16 @@ class Command(BaseCommand):
             if limit < 0:
                 raise CommandError(f"--limit must be >= 0, got {limit}")
             queryset = queryset[:limit] if limit > 0 else queryset.none()
-        return list(queryset)
+        cases = list(queryset)
+        # Python-level CIAA cohort filter: only cases with a "special:*" court-case ref
+        return [c for c in cases if self._is_ciaa_case(c)]
+
+    @staticmethod
+    def _is_ciaa_case(case):
+        refs = case.court_cases or []
+        return isinstance(refs, list) and any(
+            isinstance(r, str) and r.startswith("special:") for r in refs
+        )
 
     def _fetch_source_cache(self, cases):
         source_ids = set()

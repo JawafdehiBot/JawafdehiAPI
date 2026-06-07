@@ -282,7 +282,7 @@ class TestValidateHostSafety:
 
     def test_allows_public_host(self):
         patched_addrinfo = [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))  # NOSONAR
         ]
         with patch("socket.getaddrinfo", return_value=patched_addrinfo):
             _validate_host_safety("example.com")
@@ -310,7 +310,7 @@ class TestSafeRedirectHandler:
         handler = _SafeRedirectHandler()
         req = urllib.request.Request("https://example.com/page")
         patched_addrinfo = [
-            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))  # NOSONAR
         ]
         with patch("socket.getaddrinfo", return_value=patched_addrinfo):
             result = handler.redirect_request(
@@ -378,13 +378,20 @@ class TestConfinedOutputPath:
 @pytest.mark.django_db
 class TestGetEligibleCases:
     def test_returns_only_draft_cases_without_overview(self):
-        _make_case("case-draft-no-overview", "Draft no overview")
+        _make_case(
+            "case-draft-no-overview", "Draft no overview",
+            court_cases=["special:080-CR-0001"],
+        )
         _make_case(
             "case-draft-with-overview",
             "Draft with overview",
             short_description="exists",
+            court_cases=["special:080-CR-0002"],
         )
-        _make_case("case-published", "Published", state=CaseState.PUBLISHED)
+        _make_case(
+            "case-published", "Published", state=CaseState.PUBLISHED,
+            court_cases=["special:080-CR-0003"],
+        )
 
         cmd = Command()
         cases = cmd._get_eligible_cases(limit=None, force=False, case_id=None)
@@ -395,7 +402,8 @@ class TestGetEligibleCases:
 
     def test_force_reprocesses_existing_overviews(self):
         _make_case(
-            "case-draft-with-overview", "Has overview", short_description="exists"
+            "case-draft-with-overview", "Has overview", short_description="exists",
+            court_cases=["special:080-CR-0002"],
         )
 
         cmd = Command()
@@ -404,9 +412,9 @@ class TestGetEligibleCases:
         assert "case-draft-with-overview" in ids
 
     def test_filters_by_specific_case_id(self):
-        _make_case("case-a", "A")
-        _make_case("case-b", "B")
-        _make_case("case-c", "C")
+        _make_case("case-a", "A", court_cases=["special:080-CR-0001"])
+        _make_case("case-b", "B", court_cases=["special:080-CR-0002"])
+        _make_case("case-c", "C", court_cases=["special:080-CR-0003"])
 
         cmd = Command()
         cases = cmd._get_eligible_cases(limit=None, force=False, case_id="case-b")
@@ -415,14 +423,17 @@ class TestGetEligibleCases:
 
     def test_respects_limit(self):
         for i in range(10):
-            _make_case(f"case-{i:03d}", f"Case {i}")
+            _make_case(
+                f"case-{i:03d}", f"Case {i}",
+                court_cases=["special:080-CR-0001"],
+            )
 
         cmd = Command()
         cases = cmd._get_eligible_cases(limit=3, force=False, case_id=None)
         assert len(cases) == 3
 
     def test_limit_zero_returns_empty(self):
-        _make_case("case-a", "A")
+        _make_case("case-a", "A", court_cases=["special:080-CR-0001"])
         cmd = Command()
         cases = cmd._get_eligible_cases(limit=0, force=False, case_id=None)
         assert len(cases) == 0
@@ -434,9 +445,11 @@ class TestGetEligibleCases:
             "Has description only",
             short_description="",
             description="Filled description",
+            court_cases=["special:080-CR-0001"],
         )
         _make_case(
-            "case-empty-both", "Empty both", short_description="", description=""
+            "case-empty-both", "Empty both", short_description="", description="",
+            court_cases=["special:080-CR-0002"],
         )
 
         cmd = Command()
@@ -452,11 +465,33 @@ class TestGetEligibleCases:
             "Has short desc only",
             short_description="Short desc",
             description="",
+            court_cases=["special:080-CR-0001"],
         )
         cmd = Command()
         cases = cmd._get_eligible_cases(limit=None, force=False, case_id=None)
         ids = {c.case_id for c in cases}
         assert "case-with-short" not in ids
+
+    def test_excludes_non_ciaa_cases_without_special_court_ref(self):
+        """Cases without a 'special:*' court_cases entry must be excluded."""
+        _make_case(
+            "case-no-court-ref", "No special ref",
+            court_cases=None,
+        )
+        _make_case(
+            "case-wrong-court", "Wrong court ref",
+            court_cases=["supreme:080-CR-0001"],
+        )
+        _make_case(
+            "case-empty-list", "Empty court list",
+            court_cases=[],
+        )
+        cmd = Command()
+        cases = cmd._get_eligible_cases(limit=None, force=False, case_id=None)
+        ids = {c.case_id for c in cases}
+        assert "case-no-court-ref" not in ids
+        assert "case-wrong-court" not in ids
+        assert "case-empty-list" not in ids
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1217,7 +1252,8 @@ class TestPipelineIntegration:
             "src-pr-001", "CIAA Press Release", SourceType.OFFICIAL_GOVERNMENT
         )
         case = _make_case(
-            "case-dry-001", "Dry Run Case", evidence=[{"source_id": source.source_id}]
+            "case-dry-001", "Dry Run Case", evidence=[{"source_id": source.source_id}],
+            court_cases=["special:080-CR-0001"],
         )
 
         extraction_json = {
@@ -1257,6 +1293,7 @@ class TestPipelineIntegration:
             "case-pr-only-001",
             "PR-Only Case",
             evidence=[{"source_id": source.source_id}],
+            court_cases=["special:080-CR-0001"],
         )
 
         extraction_json = {
@@ -1297,7 +1334,10 @@ class TestPipelineIntegration:
         assert "क) अभियोगदावीको सार" in case.description
 
     def test_pipeline_skips_case_with_no_evidence(self):
-        case = _make_case("case-no-evidence-001", "No Evidence")
+        case = _make_case(
+            "case-no-evidence-001", "No Evidence",
+            court_cases=["special:080-CR-0001"],
+        )
 
         out = StringIO()
         call_command("enrich_case_overview", stdout=out)
@@ -1311,6 +1351,7 @@ class TestPipelineIntegration:
             "case-media-only-001",
             "Media Only",
             evidence=[{"source_id": source.source_id}],
+            court_cases=["special:080-CR-0001"],
         )
 
         out = StringIO()
@@ -1327,10 +1368,12 @@ class TestPipelineIntegration:
             "src-pr-003", "Press Release — CIAA", SourceType.OFFICIAL_GOVERNMENT
         )
         case_a = _make_case(
-            "case-a-001", "A", evidence=[{"source_id": source.source_id}]
+            "case-a-001", "A", evidence=[{"source_id": source.source_id}],
+            court_cases=["special:080-CR-0001"],
         )
         case_b = _make_case(
-            "case-b-001", "B", evidence=[{"source_id": source.source_id}]
+            "case-b-001", "B", evidence=[{"source_id": source.source_id}],
+            court_cases=["special:080-CR-0002"],
         )
 
         extraction_json = {
@@ -1368,6 +1411,7 @@ class TestPipelineIntegration:
             evidence=[{"source_id": source.source_id}],
             short_description="existing",
             description="existing content",
+            court_cases=["special:080-CR-0001"],
         )
 
         extraction_json = {"accused_persons": [], "case_metadata": {}}
@@ -1398,6 +1442,7 @@ class TestPipelineIntegration:
                 f"case-limit-{i:03d}",
                 f"Case {i}",
                 evidence=[{"source_id": source.source_id}],
+                court_cases=["special:080-CR-0001"],
             )
 
         extraction_json = {"accused_persons": [], "case_metadata": {}}
