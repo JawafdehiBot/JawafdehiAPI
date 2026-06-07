@@ -379,7 +379,8 @@ class TestConfinedOutputPath:
 class TestGetEligibleCases:
     def test_returns_only_draft_cases_without_overview(self):
         _make_case(
-            "case-draft-no-overview", "Draft no overview",
+            "case-draft-no-overview",
+            "Draft no overview",
             court_cases=["special:080-CR-0001"],
         )
         _make_case(
@@ -389,7 +390,9 @@ class TestGetEligibleCases:
             court_cases=["special:080-CR-0002"],
         )
         _make_case(
-            "case-published", "Published", state=CaseState.PUBLISHED,
+            "case-published",
+            "Published",
+            state=CaseState.PUBLISHED,
             court_cases=["special:080-CR-0003"],
         )
 
@@ -402,7 +405,9 @@ class TestGetEligibleCases:
 
     def test_force_reprocesses_existing_overviews(self):
         _make_case(
-            "case-draft-with-overview", "Has overview", short_description="exists",
+            "case-draft-with-overview",
+            "Has overview",
+            short_description="exists",
             court_cases=["special:080-CR-0002"],
         )
 
@@ -424,7 +429,8 @@ class TestGetEligibleCases:
     def test_respects_limit(self):
         for i in range(10):
             _make_case(
-                f"case-{i:03d}", f"Case {i}",
+                f"case-{i:03d}",
+                f"Case {i}",
                 court_cases=["special:080-CR-0001"],
             )
 
@@ -448,7 +454,10 @@ class TestGetEligibleCases:
             court_cases=["special:080-CR-0001"],
         )
         _make_case(
-            "case-empty-both", "Empty both", short_description="", description="",
+            "case-empty-both",
+            "Empty both",
+            short_description="",
+            description="",
             court_cases=["special:080-CR-0002"],
         )
 
@@ -475,15 +484,18 @@ class TestGetEligibleCases:
     def test_excludes_non_ciaa_cases_without_special_court_ref(self):
         """Cases without a 'special:*' court_cases entry must be excluded."""
         _make_case(
-            "case-no-court-ref", "No special ref",
+            "case-no-court-ref",
+            "No special ref",
             court_cases=None,
         )
         _make_case(
-            "case-wrong-court", "Wrong court ref",
+            "case-wrong-court",
+            "Wrong court ref",
             court_cases=["supreme:080-CR-0001"],
         )
         _make_case(
-            "case-empty-list", "Empty court list",
+            "case-empty-list",
+            "Empty court list",
             court_cases=[],
         )
         cmd = Command()
@@ -1252,7 +1264,9 @@ class TestPipelineIntegration:
             "src-pr-001", "CIAA Press Release", SourceType.OFFICIAL_GOVERNMENT
         )
         case = _make_case(
-            "case-dry-001", "Dry Run Case", evidence=[{"source_id": source.source_id}],
+            "case-dry-001",
+            "Dry Run Case",
+            evidence=[{"source_id": source.source_id}],
             court_cases=["special:080-CR-0001"],
         )
 
@@ -1335,7 +1349,8 @@ class TestPipelineIntegration:
 
     def test_pipeline_skips_case_with_no_evidence(self):
         case = _make_case(
-            "case-no-evidence-001", "No Evidence",
+            "case-no-evidence-001",
+            "No Evidence",
             court_cases=["special:080-CR-0001"],
         )
 
@@ -1368,11 +1383,15 @@ class TestPipelineIntegration:
             "src-pr-003", "Press Release — CIAA", SourceType.OFFICIAL_GOVERNMENT
         )
         case_a = _make_case(
-            "case-a-001", "A", evidence=[{"source_id": source.source_id}],
+            "case-a-001",
+            "A",
+            evidence=[{"source_id": source.source_id}],
             court_cases=["special:080-CR-0001"],
         )
         case_b = _make_case(
-            "case-b-001", "B", evidence=[{"source_id": source.source_id}],
+            "case-b-001",
+            "B",
+            evidence=[{"source_id": source.source_id}],
             court_cases=["special:080-CR-0002"],
         )
 
