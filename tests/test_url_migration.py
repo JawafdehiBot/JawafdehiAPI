@@ -339,3 +339,64 @@ class TestSourceLinkDictFormat:
         assert SourceLinkRole.MARKDOWN.value == "MARKDOWN"
         assert SourceLinkRole.PERMALINK.value == "PERMALINK"
         assert len(list(SourceLinkRole)) == 3
+
+    def test_create_serializer_rejects_invalid_url(self):
+        """SourceLinkField should reject invalid URLs."""
+        from cases.serializers import DocumentSourceCreateSerializer
+
+        data = {
+            "title": "Invalid URL Test",
+            "url": ["not-a-url"],
+        }
+        serializer = DocumentSourceCreateSerializer(data=data)
+        assert not serializer.is_valid()
+
+    def test_create_serializer_rejects_dict_invalid_url(self):
+        """SourceLinkField should reject dict with invalid URL."""
+        from cases.serializers import DocumentSourceCreateSerializer
+
+        data = {
+            "title": "Invalid Dict URL Test",
+            "url": [{"link": "not-a-url", "role": "RAW"}],
+        }
+        serializer = DocumentSourceCreateSerializer(data=data)
+        assert not serializer.is_valid()
+
+    def test_create_serializer_strips_whitespace(self):
+        """SourceLinkField should strip whitespace from URLs."""
+        from cases.serializers import DocumentSourceCreateSerializer
+
+        data = {
+            "title": "Whitespace Test",
+            "url": ["  https://example.com/doc  "],
+        }
+        serializer = DocumentSourceCreateSerializer(data=data)
+        assert serializer.is_valid(), f"Errors: {serializer.errors}"
+        assert serializer.validated_data["url"] == ["https://example.com/doc"]
+
+    def test_create_serializer_sanitizes_extra_dict_keys(self):
+        """SourceLinkField should strip extra keys from dict input."""
+        from cases.serializers import DocumentSourceCreateSerializer
+
+        data = {
+            "title": "Extra Keys Test",
+            "url": [{"link": "https://example.com/doc", "role": "RAW", "malicious": "payload"}],
+        }
+        serializer = DocumentSourceCreateSerializer(data=data)
+        assert serializer.is_valid(), f"Errors: {serializer.errors}"
+        assert serializer.validated_data["url"] == [
+            {"link": "https://example.com/doc", "role": "RAW"}
+        ]
+
+    def test_representation_defaults_none_role_to_raw(self):
+        """to_representation should default None role to RAW."""
+        from cases.serializers import DocumentSourceSerializer
+
+        source = DocumentSource.objects.create(
+            title="None Role Test",
+            url=[{"link": "https://example.com/doc", "role": None}],
+        )
+        serializer = DocumentSourceSerializer(source)
+        assert serializer.data["url"] == [
+            {"link": "https://example.com/doc", "role": "RAW"}
+        ]

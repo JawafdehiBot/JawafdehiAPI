@@ -306,8 +306,19 @@ class SourceLinkField(serializers.Field):
     """Field that accepts a plain URL string or a ``{'link': str, 'role': str}`` dict."""
 
     def to_internal_value(self, data):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from django.core.validators import URLValidator
+
+        validator = URLValidator()
+
         if isinstance(data, str):
-            return data
+            stripped = data.strip()
+            try:
+                validator(stripped)
+            except DjangoValidationError:
+                raise serializers.ValidationError("Enter a valid URL.")
+            return stripped
+
         if isinstance(data, dict):
             link = data.get("link")
             role = data.get("role")
@@ -315,15 +326,24 @@ class SourceLinkField(serializers.Field):
                 raise serializers.ValidationError(
                     "Dict must contain a 'link' key with a non-empty string value."
                 )
+            stripped_link = link.strip()
+            try:
+                validator(stripped_link)
+            except DjangoValidationError:
+                raise serializers.ValidationError("Enter a valid URL.")
+
+            cleaned = {"link": stripped_link}
             if role is not None:
                 try:
                     SourceLinkRole(role)
+                    cleaned["role"] = role
                 except ValueError:
                     raise serializers.ValidationError(
                         f"Invalid role '{role}'. Must be one of "
                         f"{[r.value for r in SourceLinkRole]}."
                     )
-            return data
+            return cleaned
+
         raise serializers.ValidationError(
             "Must be a URL string or a dict with 'link' key."
         )
@@ -331,6 +351,11 @@ class SourceLinkField(serializers.Field):
     def to_representation(self, value):
         if isinstance(value, str):
             return {"link": value, "role": SourceLinkRole.RAW.value}
+        if isinstance(value, dict):
+            return {
+                "link": value.get("link"),
+                "role": value.get("role") or SourceLinkRole.RAW.value,
+            }
         return value
 
 
@@ -373,7 +398,7 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
         for item in list(obj.url or []):
             if isinstance(item, dict):
                 link = item.get("link")
-                role = item.get("role", "RAW")
+                role = item.get("role") or "RAW"
                 add_url(link, role)
             else:
                 add_url(item)
