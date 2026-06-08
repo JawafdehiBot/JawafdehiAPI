@@ -2,7 +2,12 @@
     {% for value in values %}
     <div class="input-row" draggable="true">
         <span class="drag-handle">⋮⋮</span>
-        <input type="url" class="url-input" value="{{ value }}" placeholder="https://example.com">
+        <input type="url" class="url-input" value="{{ value.link }}" placeholder="https://example.com">
+        <select class="url-role-select">
+            <option value="RAW" {% if value.role == "RAW" %}selected{% endif %}>RAW</option>
+            <option value="MARKDOWN" {% if value.role == "MARKDOWN" %}selected{% endif %}>Markdown</option>
+            <option value="PERMALINK" {% if value.role == "PERMALINK" %}selected{% endif %}>Permalink</option>
+        </select>
         <button type="button" class="btn btn-sm btn-danger remove-input" aria-label="Remove URL">
             <i class="fas fa-times" aria-hidden="true"></i>
         </button>
@@ -25,6 +30,11 @@ window.initMultiWidget(
         rowTemplate: [
             '<span class="drag-handle">⋮⋮</span>',
             '<input type="url" class="url-input" placeholder="https://example.com">',
+            '<select class="url-role-select">',
+            '<option value="RAW" selected>RAW</option>',
+            '<option value="MARKDOWN">Markdown</option>',
+            '<option value="PERMALINK">Permalink</option>',
+            '</select>',
             '<button type="button" class="btn btn-sm btn-danger remove-input" aria-label="Remove URL">',
             '<i class="fas fa-times" aria-hidden="true"></i>',
             '</button>'

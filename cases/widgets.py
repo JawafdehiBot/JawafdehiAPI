@@ -9,6 +9,8 @@ from django.template.loader import render_to_string
 from django.utils.safestring import mark_safe
 from nes.core.identifiers.validators import validate_entity_id
 
+from .models import SourceLinkRole
+
 
 class EasyMDEWidget(Textarea):
     class Media:
@@ -304,8 +306,8 @@ class MultiURLWidget(BaseMultiWidget):
 
     def get_context(self, name, value, attrs):
         """
-        Override to handle invalid JSON gracefully.
-        If JSON parsing fails, treat as empty list so form can render with validation error.
+        Override to handle invalid JSON gracefully and normalise str entries
+        to ``{link, role}`` dict form.
         """
         if value is None:
             value = []
@@ -315,6 +317,17 @@ class MultiURLWidget(BaseMultiWidget):
             except (JSONDecodeError, TypeError):
                 # Invalid JSON - use empty list so form can render and show validation error
                 value = []
+
+        # Normalise plain strings to dict format
+        normalised = []
+        for item in value:
+            if isinstance(item, str):
+                normalised.append({"link": item, "role": None})
+            elif isinstance(item, dict):
+                normalised.append(item)
+            else:
+                normalised.append(item)
+        value = normalised
 
         final_attrs = self.build_attrs(self.attrs, attrs)
         widget_id = final_attrs.get("id", name)
@@ -359,28 +372,42 @@ class MultiURLField(Field):
 
     def validate(self, value):
         super().validate(value)
-        # Validate each URL
         if value:
             validator = URLValidator()
-            for url in value:
-                # Check type before calling .strip()
-                if not isinstance(url, str):
+            for item in value:
+                if isinstance(item, dict):
+                    link = item.get("link", "")
+                    role = item.get("role")
+                    if not isinstance(link, str) or not link.strip():
+                        raise ValidationError(
+                            "Each URL dict must contain a non-blank 'link' string."
+                        )
+                    if role is not None:
+                        try:
+                            SourceLinkRole(role)
+                        except ValueError:
+                            raise ValidationError(
+                                f"Invalid role '{role}'. Must be one of: "
+                                f"{', '.join(e.value for e in SourceLinkRole)}"
+                            )
+                    normalized = link.strip()
+                elif isinstance(item, str):
+                    normalized = item.strip()
+                else:
                     raise ValidationError(
-                        f"Invalid URL type: expected string, got {type(url).__name__} ({url!r})"
+                        f"Invalid URL type: expected string or dict, got "
+                        f"{type(item).__name__} ({item!r})"
                     )
 
-                # Normalize and check if empty
-                normalized = url.strip()
                 if not normalized:
-                    # Reject whitespace-only or empty URLs at form validation time
                     raise ValidationError(
-                        f"URL cannot be blank or whitespace-only: {url!r}"
+                        f"URL cannot be blank or whitespace-only: {item!r}"
                     )
 
                 try:
                     validator(normalized)
                 except ValidationError as err:
-                    raise ValidationError(f"Invalid URL: {url}") from err
+                    raise ValidationError(f"Invalid URL: {item}") from err
 
 
 class MultiCourtCaseWidget(BaseMultiWidget):

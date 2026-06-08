@@ -185,8 +185,15 @@ window.MultiWidgetConfigs = {
         inputClass: 'url-input',
         rowClass: 'input-row',
         getValues: (container) => {
-            const inputs = container.querySelectorAll('.url-input');
-            return Array.from(inputs).map(i => i.value.trim()).filter(v => v);
+            const rows = container.querySelectorAll('.input-row');
+            return Array.from(rows).map(row => {
+                const linkInput = row.querySelector('.url-input');
+                const roleSelect = row.querySelector('.url-role-select');
+                const link = linkInput ? linkInput.value.trim() : '';
+                if (!link) return null;
+                const role = roleSelect ? roleSelect.value : 'RAW';
+                return { link, role };
+            }).filter(v => v);
         }
     },
 
