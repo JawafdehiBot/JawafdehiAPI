@@ -268,16 +268,18 @@ class TestSourceLinkDictFormat:
 
     def test_validate_url_list_rejects_invalid_role(self):
         """validate_url_list should reject dict with invalid role."""
-        from cases.models import validate_url_list
         from django.core.exceptions import ValidationError
+
+        from cases.models import validate_url_list
 
         with pytest.raises(ValidationError):
             validate_url_list([{"link": "https://example.com/doc", "role": "INVALID"}])
 
     def test_validate_url_list_rejects_dict_missing_link(self):
         """validate_url_list should reject dict missing link key."""
-        from cases.models import validate_url_list
         from django.core.exceptions import ValidationError
+
+        from cases.models import validate_url_list
 
         with pytest.raises(ValidationError):
             validate_url_list([{"role": "RAW"}])
