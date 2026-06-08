@@ -376,7 +376,9 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
             name="SourceLink",
             fields={
                 "link": serializers.URLField(),
-                "role": serializers.ChoiceField(choices=[r.value for r in SourceLinkRole]),
+                "role": serializers.ChoiceField(
+                    choices=[r.value for r in SourceLinkRole]
+                ),
             },
         )
     )

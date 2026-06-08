@@ -245,20 +245,24 @@ class TestSourceLinkDictFormat:
         from cases.models import validate_url_list
 
         # Should not raise
-        validate_url_list([
-            {"link": "https://example.com/doc1", "role": "RAW"},
-            {"link": "https://example.com/doc2.md", "role": "MARKDOWN"},
-            {"link": "https://example.com/permalink", "role": "PERMALINK"},
-        ])
+        validate_url_list(
+            [
+                {"link": "https://example.com/doc1", "role": "RAW"},
+                {"link": "https://example.com/doc2.md", "role": "MARKDOWN"},
+                {"link": "https://example.com/permalink", "role": "PERMALINK"},
+            ]
+        )
 
     def test_validate_url_list_accepts_mixed_list(self):
         """validate_url_list should accept a mix of str and dict."""
         from cases.models import validate_url_list
 
-        validate_url_list([
-            "https://example.com/plain",
-            {"link": "https://example.com/dict", "role": "RAW"},
-        ])
+        validate_url_list(
+            [
+                "https://example.com/plain",
+                {"link": "https://example.com/dict", "role": "RAW"},
+            ]
+        )
 
     def test_validate_url_list_accepts_dict_without_role(self):
         """role is optional in dict — defaults to None which is valid."""
@@ -380,7 +384,13 @@ class TestSourceLinkDictFormat:
 
         data = {
             "title": "Extra Keys Test",
-            "url": [{"link": "https://example.com/doc", "role": "RAW", "malicious": "payload"}],
+            "url": [
+                {
+                    "link": "https://example.com/doc",
+                    "role": "RAW",
+                    "malicious": "payload",
+                }
+            ],
         }
         serializer = DocumentSourceCreateSerializer(data=data)
         assert serializer.is_valid(), f"Errors: {serializer.errors}"
