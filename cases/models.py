@@ -4,6 +4,7 @@ Models for the Jawafdehi accountability platform.
 See: .kiro/specs/accountability-platform-core/design.md
 """
 
+import enum
 import mimetypes
 import uuid
 
@@ -23,15 +24,24 @@ from .validators import validate_court_cases, validate_slug
 User = get_user_model()
 
 
+class SourceLinkRole(enum.StrEnum):
+    RAW = "RAW"
+    MARKDOWN = "MARKDOWN"
+    PERMALINK = "PERMALINK"
+
+
 def validate_url_list(value):
     """
     Validate that the url field contains a list of valid URLs.
 
+    Each item may be a plain URL string or a dict with ``link`` and ``role``
+    keys where ``role`` is a valid ``SourceLinkRole`` value.
+
     Args:
-        value: The value to validate (should be a list of URL strings)
+        value: The value to validate (should be a list of URL strings or dicts)
 
     Raises:
-        ValidationError: If value is not a list or contains invalid URLs
+        ValidationError: If value is not a list or contains invalid items
     """
     if value in (None, []):
         return
@@ -41,15 +51,32 @@ def validate_url_list(value):
 
     validator = URLValidator()
     for item in value:
-        if not isinstance(item, str):
-            raise ValidationError("Each URL must be a string.")
+        if isinstance(item, str):
+            stripped = item.strip()
+            if not stripped:
+                raise ValidationError("URLs cannot be blank or whitespace-only.")
+            validator(stripped)
+        elif isinstance(item, dict):
+            link = item.get("link")
+            if not link or not isinstance(link, str) or not link.strip():
+                raise ValidationError(
+                    "Each URL dict must contain a non-blank 'link' string."
+                )
+            validator(link.strip())
 
-        # Strip whitespace and validate
-        stripped = item.strip()
-        if not stripped:
-            raise ValidationError("URLs cannot be blank or whitespace-only.")
-
-        validator(stripped)
+            role = item.get("role")
+            if role is not None:
+                try:
+                    SourceLinkRole(role)
+                except ValueError:
+                    raise ValidationError(
+                        f"Invalid role '{role}'. Must be one of "
+                        f"{[r.value for r in SourceLinkRole]}."
+                    )
+        else:
+            raise ValidationError(
+                "Each URL must be a string or a dict with 'link' and 'role' keys."
+            )
 
 
 # File upload configuration

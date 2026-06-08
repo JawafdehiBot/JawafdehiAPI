@@ -230,4 +230,110 @@ class TestURLFieldPostMigration:
         )
 
         serializer = DocumentSourceSerializer(source)
-        assert serializer.data["url"] == ["https://example.com", "https://backup.com"]
+        assert serializer.data["url"] == [
+            {"link": "https://example.com", "role": "RAW"},
+            {"link": "https://backup.com", "role": "RAW"},
+        ]
+
+
+@pytest.mark.django_db
+class TestSourceLinkDictFormat:
+    """Tests for the source link dict format support."""
+
+    def test_validate_url_list_accepts_dict_items(self):
+        """validate_url_list should accept dict items with link+role."""
+        from cases.models import validate_url_list
+
+        # Should not raise
+        validate_url_list([
+            {"link": "https://example.com/doc1", "role": "RAW"},
+            {"link": "https://example.com/doc2.md", "role": "MARKDOWN"},
+            {"link": "https://example.com/permalink", "role": "PERMALINK"},
+        ])
+
+    def test_validate_url_list_accepts_mixed_list(self):
+        """validate_url_list should accept a mix of str and dict."""
+        from cases.models import validate_url_list
+
+        validate_url_list([
+            "https://example.com/plain",
+            {"link": "https://example.com/dict", "role": "RAW"},
+        ])
+
+    def test_validate_url_list_accepts_dict_without_role(self):
+        """role is optional in dict — defaults to None which is valid."""
+        from cases.models import validate_url_list
+
+        validate_url_list([{"link": "https://example.com/doc"}])
+
+    def test_validate_url_list_rejects_invalid_role(self):
+        """validate_url_list should reject dict with invalid role."""
+        from cases.models import validate_url_list
+        from django.core.exceptions import ValidationError
+
+        with pytest.raises(ValidationError):
+            validate_url_list([{"link": "https://example.com/doc", "role": "INVALID"}])
+
+    def test_validate_url_list_rejects_dict_missing_link(self):
+        """validate_url_list should reject dict missing link key."""
+        from cases.models import validate_url_list
+        from django.core.exceptions import ValidationError
+
+        with pytest.raises(ValidationError):
+            validate_url_list([{"role": "RAW"}])
+
+    def test_create_serializer_accepts_dict_urls(self):
+        """DocumentSourceCreateSerializer should accept dict format URLs."""
+        from cases.serializers import DocumentSourceCreateSerializer
+
+        data = {
+            "title": "Dict URL Test",
+            "url": [
+                "https://example.com/plain",
+                {"link": "https://example.com/with-role", "role": "MARKDOWN"},
+            ],
+        }
+        serializer = DocumentSourceCreateSerializer(data=data)
+        assert serializer.is_valid(), f"Errors: {serializer.errors}"
+        assert serializer.validated_data["url"] == [
+            "https://example.com/plain",
+            {"link": "https://example.com/with-role", "role": "MARKDOWN"},
+        ]
+
+    def test_create_serializer_accepts_plain_strings(self):
+        """DocumentSourceCreateSerializer should still accept plain strings."""
+        from cases.serializers import DocumentSourceCreateSerializer
+
+        data = {
+            "title": "Plain URL Test",
+            "url": ["https://example.com/doc"],
+        }
+        serializer = DocumentSourceCreateSerializer(data=data)
+        assert serializer.is_valid(), f"Errors: {serializer.errors}"
+        assert serializer.validated_data["url"] == ["https://example.com/doc"]
+
+    def test_serializer_outputs_dict_format(self):
+        """DocumentSourceSerializer should output {link, role} dicts."""
+        from cases.serializers import DocumentSourceSerializer
+
+        source = DocumentSource.objects.create(
+            title="Dict Output Test",
+            url=[
+                "https://example.com/plain",
+                {"link": "https://example.com/markdown", "role": "MARKDOWN"},
+            ],
+        )
+        serializer = DocumentSourceSerializer(source)
+        assert serializer.data["url"] == [
+            {"link": "https://example.com/plain", "role": "RAW"},
+            {"link": "https://example.com/markdown", "role": "MARKDOWN"},
+        ]
+
+    def test_source_link_role_enum_values(self):
+        """SourceLinkRole enum should have expected members."""
+        from cases.models import SourceLinkRole
+
+        assert SourceLinkRole.RAW.value == "RAW"
+        assert SourceLinkRole.MARKDOWN.value == "MARKDOWN"
+        assert SourceLinkRole.PERMALINK.value == "PERMALINK"
+        assert len(list(SourceLinkRole)) == 3

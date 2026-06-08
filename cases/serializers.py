@@ -17,6 +17,7 @@ from .models import (
     DocumentSource,
     Feedback,
     JawafEntity,
+    SourceLinkRole,
 )
 
 logger = logging.getLogger(__name__)
@@ -301,6 +302,38 @@ class CaseDetailSerializer(CaseSerializer):
         pass
 
 
+class SourceLinkField(serializers.Field):
+    """Field that accepts a plain URL string or a ``{'link': str, 'role': str}`` dict."""
+
+    def to_internal_value(self, data):
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            link = data.get("link")
+            role = data.get("role")
+            if not link or not isinstance(link, str) or not link.strip():
+                raise serializers.ValidationError(
+                    "Dict must contain a 'link' key with a non-empty string value."
+                )
+            if role is not None:
+                try:
+                    SourceLinkRole(role)
+                except ValueError:
+                    raise serializers.ValidationError(
+                        f"Invalid role '{role}'. Must be one of "
+                        f"{[r.value for r in SourceLinkRole]}."
+                    )
+            return data
+        raise serializers.ValidationError(
+            "Must be a URL string or a dict with 'link' key."
+        )
+
+    def to_representation(self, value):
+        if isinstance(value, str):
+            return {"link": value, "role": SourceLinkRole.RAW.value}
+        return value
+
+
 class DocumentSourceSerializer(serializers.ModelSerializer):
     """
     Serializer for DocumentSource model.
@@ -309,15 +342,25 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
     """
 
     url = serializers.SerializerMethodField(
-        help_text="List of URLs for this source, including uploaded file URL when available"
+        help_text="List of URL dicts with 'link' and 'role' keys for this source, "
+        "including uploaded file URL when available"
     )
 
+    @extend_schema_field(
+        inline_serializer(
+            name="SourceLink",
+            fields={
+                "link": serializers.URLField(),
+                "role": serializers.ChoiceField(choices=[r.value for r in SourceLinkRole]),
+            },
+        )
+    )
     def get_url(self, obj):
         request = self.context.get("request")
         merged_urls = []
         seen = set()
 
-        def add_url(value):
+        def add_url(value, role="RAW"):
             if not value:
                 return
             candidate = value
@@ -325,14 +368,19 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
                 candidate = request.build_absolute_uri(candidate)
             if candidate not in seen:
                 seen.add(candidate)
-                merged_urls.append(candidate)
+                merged_urls.append({"link": candidate, "role": role})
 
-        for url in list(obj.url or []):
-            add_url(url)
+        for item in list(obj.url or []):
+            if isinstance(item, dict):
+                link = item.get("link")
+                role = item.get("role", "RAW")
+                add_url(link, role)
+            else:
+                add_url(item)
 
         if obj.uploaded_file:
             try:
-                add_url(obj.uploaded_file.url)
+                add_url(obj.uploaded_file.url, "PERMALINK")
             except Exception:
                 pass
 
@@ -345,7 +393,7 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
             )
             for uploaded_file in uploads_iterable:
                 try:
-                    add_url(uploaded_file.file.url)
+                    add_url(uploaded_file.file.url, "PERMALINK")
                 except Exception:
                     pass
 
@@ -523,10 +571,11 @@ class DocumentSourceCreateSerializer(serializers.ModelSerializer):
     """Serializer for creating DocumentSource records with file uploads via API."""
 
     url = serializers.ListField(
-        child=serializers.URLField(),
+        child=SourceLinkField(),
         required=False,
         default=list,
-        help_text="List of external URLs for this source (e.g. original article link)",
+        help_text="List of external URLs for this source (e.g. original article link). "
+        "Each item may be a plain URL string or a dict with 'link' and 'role' keys.",
     )
 
     class Meta:
