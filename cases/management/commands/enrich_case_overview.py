@@ -74,6 +74,7 @@ See also
 
 import asyncio
 import hashlib
+import http.client
 import ipaddress
 import json
 import logging
@@ -430,6 +431,83 @@ def _validate_host_safety(hostname: str) -> None:
             raise ValueError(f"Blocked internal address: {hostname!r} -> {addr}")
 
 
+class _ValidatedHTTPConnection(http.client.HTTPConnection):
+    """Resolves DNS + validates IP + connects atomically in connect().
+    Eliminates the DNS-rebinding TOCTOU gap between validate and connect.
+    """
+
+    def connect(self):
+        addrinfo = socket.getaddrinfo(self.host, self.port)
+        last_exc = None
+        for info in addrinfo:
+            addr = ipaddress.ip_address(info[4][0])
+            if (
+                addr.is_loopback
+                or addr.is_private
+                or addr.is_link_local
+                or addr.is_reserved
+            ):
+                raise ValueError(f"Blocked internal address: {self.host!r} -> {addr}")
+            try:
+                sock = self._create_connection(
+                    (info[4][0], self.port), self.timeout, self.source_address
+                )
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock = sock
+                return
+            except OSError as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
+
+
+class _ValidatedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS version of _ValidatedHTTPConnection — resolves, validates, connects atomically."""
+
+    def connect(self):
+        addrinfo = socket.getaddrinfo(self.host, self.port)
+        last_exc = None
+        for info in addrinfo:
+            addr = ipaddress.ip_address(info[4][0])
+            if (
+                addr.is_loopback
+                or addr.is_private
+                or addr.is_link_local
+                or addr.is_reserved
+            ):
+                raise ValueError(f"Blocked internal address: {self.host!r} -> {addr}")
+            try:
+                sock = self._create_connection(
+                    (info[4][0], self.port), self.timeout, self.source_address
+                )
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                if self._tunnel_host:
+                    self._tunnel()
+                sock = self._context.wrap_socket(sock, server_hostname=self.host)
+                self.sock = sock
+                return
+            except OSError as exc:
+                last_exc = exc
+                continue
+        if last_exc is not None:
+            raise last_exc
+
+
+class _ValidatedHTTPHandler(urllib.request.HTTPHandler):
+    """HTTP handler using _ValidatedHTTPConnection — atomic DNS + validation."""
+
+    def http_open(self, req):
+        return self.do_open(_ValidatedHTTPConnection, req)
+
+
+class _ValidatedHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS handler using _ValidatedHTTPSConnection — atomic DNS + validation."""
+
+    def https_open(self, req):
+        return self.do_open(_ValidatedHTTPSConnection, req)
+
+
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         parsed = urllib.parse.urlparse(newurl)
@@ -437,12 +515,8 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
             raise urllib.error.HTTPError(
                 req.full_url, code, f"Unsafe redirect to {newurl}", headers, fp
             )
-        try:
-            _validate_host_safety(parsed.hostname)
-        except ValueError as exc:
-            raise urllib.error.HTTPError(
-                req.full_url, code, f"Unsafe redirect to {newurl}: {exc}", headers, fp
-            ) from exc
+        # IP safety is enforced at connect() by _ValidatedHTTPConnection
+        # and _ValidatedHTTPSConnection — no TOCTOU gap.
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -505,7 +579,7 @@ def normalize_base_url(url: str | None) -> str:
         .rstrip("/")
     )
     if url.endswith("/zen/v1"):
-        return url.replace("/zen/v1", "/zen/go/v1")
+        return url.removesuffix("/zen/v1") + "/zen/go/v1"
     if url.endswith("/zen/go"):
         return f"{url}/v1"
     return url
@@ -971,6 +1045,14 @@ class Command(BaseCommand):
             return None
         try:
             uploaded.open("rb")
+            # Size guard: reject oversized before loading into memory
+            if hasattr(uploaded, "size") and uploaded.size > MAX_DOWNLOAD_BYTES:
+                logger.warning(
+                    "OLE file too large: %d bytes > %d — skipping",
+                    uploaded.size,
+                    MAX_DOWNLOAD_BYTES,
+                )
+                return None
             raw = uploaded.read()
         except Exception:
             return None
@@ -1307,7 +1389,18 @@ class Command(BaseCommand):
             logger.info("Map-reduce: %d/%d chunks succeeded", len(parsed), len(chunks))
             return self._merge_chunk_extractions(parsed)
 
-        return asyncio.run(_run())
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — safe
+            return asyncio.run(_run())
+        # Running loop exists (uvicorn, pytest-asyncio, Jupyter)
+        # Use new loop to avoid RuntimeError without interfering
+        new_loop = asyncio.new_event_loop()
+        try:
+            return new_loop.run_until_complete(_run())
+        finally:
+            new_loop.close()
 
     # ── Per-case processing ───────────────────────────────────────
 
@@ -1481,7 +1574,12 @@ class Command(BaseCommand):
                 else "(No financial documents available)"
             )
 
-            bigo = f"रू {case.bigo:,}" if case.bigo else "उल्लेख छैन"
+            if isinstance(case.bigo, (int, float)):
+                bigo = f"रू {case.bigo:,}"
+            elif case.bigo:
+                bigo = f"रू {case.bigo}"
+            else:
+                bigo = "उल्लेख छैन"
             prompt = EXTRACTION_USER_PROMPT.format(
                 case_id=case.case_id,
                 case_title=case.title,
@@ -1969,6 +2067,9 @@ class Command(BaseCommand):
                         f"response from {response_model!r}"
                     )
                 return _extract_json_body(raw)
+            except ValueError:
+                # Model mismatch or other logic error — not retriable
+                raise
             except Exception as exc:
                 logger.warning(
                     "LLM anthropic: attempt %d — %s: %s",
@@ -2083,7 +2184,6 @@ class Command(BaseCommand):
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(f"Invalid URL {url!r}")
-        _validate_host_safety(parsed.hostname)
         out_path = _confined_output_path(
             output_dir, _sanitize_download_filename(parsed.path, source_id)
         )
@@ -2098,9 +2198,14 @@ class Command(BaseCommand):
                     )
                 },
             )
-            with urllib.request.build_opener(_SafeRedirectHandler()).open(
-                request, timeout=30
-            ) as response:
+            # Use validated handlers — DNS resolve + IP validation in a single
+            # connect() step, closing the TOCTOU gap between _validate_host_safety
+            # and urlopen.
+            with urllib.request.build_opener(
+                _ValidatedHTTPHandler,
+                _ValidatedHTTPSHandler,
+                _SafeRedirectHandler(),
+            ).open(request, timeout=30) as response:
                 _copy_stream_to_path_with_limit(response, out_path)
             return out_path
         except OSError:
