@@ -151,8 +151,9 @@ class TestMapPressReleaseFiles:
 
             # Source should have both the web URL and file URLs
             assert len(source.url) == 3  # web URL + 2 file URLs
-            assert any("ciaa.gov.np/pressrelease/3173" in url for url in source.url)
-            assert sum("ngm-store.jawafdehi.org" in url for url in source.url) == 2
+            links = [u["link"] if isinstance(u, dict) else u for u in source.url]
+            assert any("ciaa.gov.np/pressrelease/3173" in link for link in links)
+            assert sum("ngm-store.jawafdehi.org" in link for link in links) == 2
 
             # Evidence description should show file count
             assert "2 documents" in evidence_entry["description"]

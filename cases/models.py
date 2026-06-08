@@ -907,7 +907,7 @@ class DocumentSource(models.Model):
                         normalized.append({"link": stripped, "role": None})
                 elif isinstance(item, dict):
                     link = item.get("link", "")
-                    stripped = link.strip() if link else ""
+                    stripped = link.strip() if isinstance(link, str) else ""
                     if stripped:
                         entry = {"link": stripped}
                         role = item.get("role")

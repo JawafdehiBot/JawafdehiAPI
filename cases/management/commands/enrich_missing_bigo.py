@@ -453,9 +453,7 @@ class Command(BaseCommand):
             file.filename or Path(file.file.name).name
             for file in source.uploaded_files.all()
         ]
-        url_text = " ".join(
-            u.get("link") if isinstance(u, dict) else str(u) for u in (source.url or [])
-        )
+        url_text = " ".join(source.url_links)
         corpus = " ".join(
             [
                 source.title or "",

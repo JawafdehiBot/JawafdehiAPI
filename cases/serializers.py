@@ -410,8 +410,9 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
             candidate = value
             if request is not None:
                 candidate = request.build_absolute_uri(candidate)
-            if candidate not in seen:
-                seen.add(candidate)
+            dedupe_key = (candidate, role)
+            if dedupe_key not in seen:
+                seen.add(dedupe_key)
                 merged_urls.append({"link": candidate, "role": role})
 
         for item in list(obj.url or []):

@@ -37,7 +37,7 @@ class TestCreateDocumentSources:
         assert len(sources) == 1
         source = sources[0]
         assert source.source_type == SourceType.OFFICIAL_GOVERNMENT
-        assert "https://ag.gov.np/storage/test.pdf" in source.url
+        assert "https://ag.gov.np/storage/test.pdf" in source.url_links
         assert "AG Charge Sheet Test" in source.title
         assert source.publication_date is not None
 

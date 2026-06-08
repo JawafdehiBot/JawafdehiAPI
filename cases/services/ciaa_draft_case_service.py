@@ -380,7 +380,7 @@ class CIAADraftCaseService:
                 for url in url_list:
                     if (
                         source := DocumentSource.objects.filter(
-                            is_deleted=False, url__contains=[url]
+                            is_deleted=False, url__contains=[{"link": url}]
                         )
                         .only("source_id", "title")
                         .first()
@@ -393,7 +393,7 @@ class CIAADraftCaseService:
                     for source in DocumentSource.objects.filter(is_deleted=False).only(
                         "source_id", "title", "url"
                     ):
-                        if isinstance(source.url, list) and url in source.url:
+                        if url in source.url_links:
                             self.stats["sources_reused"] += 1
                             logger.debug(f"Reusing source: {title}")
                             return source

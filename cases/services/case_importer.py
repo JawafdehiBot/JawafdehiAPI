@@ -97,17 +97,27 @@ class CaseImporter:
         # Guard against None values and handle both string and list URLs
         url_raw = source_data.get("url", "")
 
-        # Handle URL as string or list
+        # Handle URL as string, list, or dict
         if isinstance(url_raw, list):
-            # Filter and normalize list entries
+            # Filter and normalize list entries — accept str or dict
             url_list = []
             for item in url_raw:
                 if isinstance(item, str):
                     stripped = item.strip()
                     if stripped:
                         url_list.append(stripped)
+                elif isinstance(item, dict):
+                    link = item.get("link") or item.get("url")
+                    if isinstance(link, str):
+                        stripped = link.strip()
+                        if stripped:
+                            url_list.append(stripped)
         elif isinstance(url_raw, str):
             stripped = url_raw.strip()
+            url_list = [stripped] if stripped else []
+        elif isinstance(url_raw, dict):
+            link = url_raw.get("link") or url_raw.get("url")
+            stripped = link.strip() if isinstance(link, str) else ""
             url_list = [stripped] if stripped else []
         else:
             url_list = []
