@@ -62,7 +62,9 @@ def validate_url_list(value):
                 raise ValidationError(
                     "Each URL dict must contain a non-blank 'link' string."
                 )
-            validator(link.strip())
+            stripped_link = link.strip()
+            validator(stripped_link)
+            item["link"] = stripped_link
 
             role = item.get("role")
             if role is not None:

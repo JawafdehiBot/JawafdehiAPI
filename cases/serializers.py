@@ -373,6 +373,7 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
 
     @extend_schema_field(
         inline_serializer(
+            many=True,
             name="SourceLink",
             fields={
                 "link": serializers.URLField(),
