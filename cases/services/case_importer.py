@@ -127,7 +127,9 @@ class CaseImporter:
         # TODO: Consider adding GIN index on url field for better performance:
         #   CREATE INDEX idx_documentsource_url_gin ON cases_documentsource USING gin (url);
         if url_list:
-            # Check if any URL in our list matches existing sources
+            # Check if any URL in our list matches existing sources.
+            # Stored URL entries are dicts with 'link' key (post-migration).
+            # Accept both str and dict lookups for backward compat during transition.
             from django.db import connection
 
             # Use PostgreSQL JSON containment if available, otherwise fall back to Python filtering
@@ -136,7 +138,10 @@ class CaseImporter:
                     source = (
                         DocumentSource.objects.filter(
                             is_deleted=False,
-                            url__contains=[url],  # PostgreSQL JSON containment operator
+                        )
+                        .filter(
+                            # Match dict entry with matching link
+                            url__contains=[{"link": url}]
                         )
                         .only("source_id", "title")
                         .first()
@@ -152,10 +157,21 @@ class CaseImporter:
                     for source in DocumentSource.objects.filter(is_deleted=False).only(
                         "source_id", "title", "url"
                     ):
-                        if isinstance(source.url, list) and url in source.url:
-                            self.stats["sources_reused"] += 1
-                            self.log(f"  Reusing source: {title}")
-                            return source
+                        if isinstance(source.url, list):
+                            for stored in source.url:
+                                stored_link = (
+                                    stored
+                                    if isinstance(stored, str)
+                                    else (
+                                        stored.get("link")
+                                        if isinstance(stored, dict)
+                                        else None
+                                    )
+                                )
+                                if stored_link == url:
+                                    self.stats["sources_reused"] += 1
+                                    self.log(f"  Reusing source: {title}")
+                                    return source
 
         # Try to find by title (excluding soft-deleted sources)
         source = DocumentSource.objects.filter(title=title, is_deleted=False).first()

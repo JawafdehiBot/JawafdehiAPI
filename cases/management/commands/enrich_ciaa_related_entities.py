@@ -349,11 +349,7 @@ class Command(BaseCommand):
         if "ciaa press release" in description:
             return True
 
-        urls = [
-            url.strip()
-            for url in (source.url or [])
-            if isinstance(url, str) and url.strip()
-        ]
+        urls = [url.strip() for url in source.url_links if url.strip()]
         for url in urls:
             if "ciaa.gov.np/pressrelease" in url.lower():
                 return True
@@ -373,11 +369,7 @@ class Command(BaseCommand):
             source.description or "",
             source.uploaded_filename or "",
         ]
-        urls = [
-            url.strip()
-            for url in (source.url or [])
-            if isinstance(url, str) and url.strip()
-        ]
+        urls = [url.strip() for url in source.url_links if url.strip()]
         corpus_parts.append(" ".join(urls))
 
         for uploaded in source.uploaded_files.all():
@@ -455,11 +447,7 @@ class Command(BaseCommand):
 
         Priority: DOCX > DOC > PDF > other (e.g., CIAA webpage HTML)
         """
-        urls = [
-            url.strip()
-            for url in (source.url or [])
-            if isinstance(url, str) and url.strip()
-        ]
+        urls = [url.strip() for url in source.url_links if url.strip()]
         if not urls:
             return []
 
@@ -523,11 +511,7 @@ class Command(BaseCommand):
         if uploaded_md:
             return uploaded_md
 
-        urls = [
-            url.strip()
-            for url in (source.url or [])
-            if isinstance(url, str) and url.strip()
-        ]
+        urls = [url.strip() for url in source.url_links if url.strip()]
         for url in urls:
             md = convert_to_markdown(url, session)
             if md:

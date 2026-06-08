@@ -204,22 +204,28 @@ class TestURLMigrationProcess(TransactionTestCase):
 class TestURLFieldPostMigration:
     """Test suite for URL field behavior after migration to JSONField."""
 
-    def test_url_field_stores_list(self):
-        """Verify url field accepts and persists a list of URLs."""
+    def test_url_field_stores_dicts(self):
+        """Verify url field stores dict format after save normalization."""
         source = DocumentSource.objects.create(
             title="Test Source", url=["https://example.com"]
         )
 
         assert isinstance(source.url, list)
-        assert source.url == ["https://example.com"]
+        assert source.url == [{"link": "https://example.com", "role": None}]
 
     def test_multiple_urls_storage(self):
-        """Verify multiple URLs can be stored and retrieved."""
-        urls = ["https://example.com", "https://backup.example.com"]
+        """Verify multiple URLs can be stored and retrieved (normalized to dicts)."""
+        urls = [
+            "https://example.com",
+            {"link": "https://backup.example.com", "role": "RAW"},
+        ]
         source = DocumentSource.objects.create(title="Test Source", url=urls)
 
         source.refresh_from_db()
-        assert source.url == urls
+        assert source.url == [
+            {"link": "https://example.com", "role": None},
+            {"link": "https://backup.example.com", "role": "RAW"},
+        ]
 
     def test_url_serialization(self):
         """Verify URLs serialize correctly in API responses."""
@@ -230,7 +236,13 @@ class TestURLFieldPostMigration:
         )
 
         serializer = DocumentSourceSerializer(source)
+        # Backward-compat url field returns strings
         assert serializer.data["url"] == [
+            "https://example.com",
+            "https://backup.com",
+        ]
+        # New urls field returns dicts
+        assert serializer.data["urls"] == [
             {"link": "https://example.com", "role": "RAW"},
             {"link": "https://backup.com", "role": "RAW"},
         ]
@@ -331,6 +343,10 @@ class TestSourceLinkDictFormat:
         )
         serializer = DocumentSourceSerializer(source)
         assert serializer.data["url"] == [
+            "https://example.com/plain",
+            "https://example.com/markdown",
+        ]
+        assert serializer.data["urls"] == [
             {"link": "https://example.com/plain", "role": "RAW"},
             {"link": "https://example.com/markdown", "role": "MARKDOWN"},
         ]
@@ -407,6 +423,167 @@ class TestSourceLinkDictFormat:
             url=[{"link": "https://example.com/doc", "role": None}],
         )
         serializer = DocumentSourceSerializer(source)
-        assert serializer.data["url"] == [
+        assert serializer.data["url"] == ["https://example.com/doc"]
+        assert serializer.data["urls"] == [
             {"link": "https://example.com/doc", "role": "RAW"}
         ]
+
+
+class TestDictFormatMigration(TransactionTestCase):
+    """Test the data migration that converts str entries to dict format."""
+
+    @staticmethod
+    def get_historical_model(connection, migration_tuple, app_label, model_name):
+        from django.db.migrations.executor import MigrationExecutor
+
+        executor = MigrationExecutor(connection)
+        project_state = executor.loader.project_state(migration_tuple)
+        return project_state.apps.get_model(app_label, model_name)
+
+    def setUp(self):
+        """Create test data with mixed str/dict URL entries before the migration."""
+        from django.utils import timezone
+
+        call_command("migrate", "cases", "0024_alter_chat_user_identity", verbosity=0)
+
+        DocumentSource = self.get_historical_model(
+            connection,
+            ("cases", "0024_alter_chat_user_identity"),
+            "cases",
+            "DocumentSource",
+        )
+
+        now = timezone.now()
+        DocumentSource.objects.bulk_create(
+            [
+                DocumentSource(
+                    source_id="source:dict:migrate:001",
+                    title="Plain strings",
+                    description="All str entries",
+                    url=["https://example.com/1", "https://example.com/2"],
+                    is_deleted=False,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                DocumentSource(
+                    source_id="source:dict:migrate:002",
+                    title="Already dicts",
+                    description="Already in dict format",
+                    url=[
+                        {"link": "https://example.com/3", "role": "RAW"},
+                    ],
+                    is_deleted=False,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                DocumentSource(
+                    source_id="source:dict:migrate:003",
+                    title="Mixed entries",
+                    description="Mix of str and dict",
+                    url=[
+                        "https://example.com/4",
+                        {"link": "https://example.com/5", "role": "MARKDOWN"},
+                    ],
+                    is_deleted=False,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                DocumentSource(
+                    source_id="source:dict:migrate:004",
+                    title="Empty list",
+                    description="Empty URL list",
+                    url=[],
+                    is_deleted=False,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+
+    def test_forward_converts_strs_to_dicts(self):
+        """Migration should convert str entries to {link, role: None} dicts."""
+        call_command("migrate", "cases", "0025_convert_url_list_to_dict", verbosity=0)
+
+        DocumentSource = self.get_historical_model(
+            connection,
+            ("cases", "0025_convert_url_list_to_dict"),
+            "cases",
+            "DocumentSource",
+        )
+
+        s1 = DocumentSource.objects.get(source_id="source:dict:migrate:001")
+        for entry in s1.url:
+            assert isinstance(entry, dict), f"Expected dict, got {entry!r}"
+            assert "link" in entry
+            assert "role" in entry
+        assert s1.url[0] == {"link": "https://example.com/1", "role": None}
+        assert s1.url[1] == {"link": "https://example.com/2", "role": None}
+
+    def test_forward_leaves_existing_dicts(self):
+        """Migration should not modify existing dict entries."""
+        call_command("migrate", "cases", "0025_convert_url_list_to_dict", verbosity=0)
+
+        DocumentSource = self.get_historical_model(
+            connection,
+            ("cases", "0025_convert_url_list_to_dict"),
+            "cases",
+            "DocumentSource",
+        )
+
+        s2 = DocumentSource.objects.get(source_id="source:dict:migrate:002")
+        assert s2.url == [{"link": "https://example.com/3", "role": "RAW"}]
+
+    def test_forward_converts_mixed_list(self):
+        """Migration should handle mixed str/dict lists."""
+        call_command("migrate", "cases", "0025_convert_url_list_to_dict", verbosity=0)
+
+        DocumentSource = self.get_historical_model(
+            connection,
+            ("cases", "0025_convert_url_list_to_dict"),
+            "cases",
+            "DocumentSource",
+        )
+
+        s3 = DocumentSource.objects.get(source_id="source:dict:migrate:003")
+        assert s3.url[0] == {"link": "https://example.com/4", "role": None}
+        assert s3.url[1] == {"link": "https://example.com/5", "role": "MARKDOWN"}
+
+    def test_forward_handles_empty_list(self):
+        """Migration should not break empty lists."""
+        call_command("migrate", "cases", "0025_convert_url_list_to_dict", verbosity=0)
+
+        DocumentSource = self.get_historical_model(
+            connection,
+            ("cases", "0025_convert_url_list_to_dict"),
+            "cases",
+            "DocumentSource",
+        )
+
+        s4 = DocumentSource.objects.get(source_id="source:dict:migrate:004")
+        assert s4.url == []
+
+    def test_reverse_converts_dicts_to_strings(self):
+        """Reverse migration should convert dict entries back to strings."""
+        call_command("migrate", "cases", "0025_convert_url_list_to_dict", verbosity=0)
+        call_command("migrate", "cases", "0024_alter_chat_user_identity", verbosity=0)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT url FROM cases_documentsource WHERE source_id = %s",
+                ["source:dict:migrate:001"],
+            )
+            url_value = cursor.fetchone()[0]
+
+        import json as _json
+
+        parsed = _json.loads(url_value) if isinstance(url_value, str) else url_value
+        assert parsed == ["https://example.com/1", "https://example.com/2"]
+
+    def tearDown(self):
+        call_command("migrate", verbosity=0)
+        super().tearDown()
+
+    @classmethod
+    def tearDownClass(cls):
+        call_command("migrate", verbosity=0)
+        super().tearDownClass()

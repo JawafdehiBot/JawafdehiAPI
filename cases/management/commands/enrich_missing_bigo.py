@@ -329,11 +329,7 @@ class Command(BaseCommand):
     def _log_source_diagnostics(self, source: DocumentSource) -> None:
         if not getattr(self, "_verbose", False):
             return
-        urls = [
-            urllib.parse.unquote(url)
-            for url in (source.url or [])
-            if isinstance(url, str)
-        ]
+        urls = [urllib.parse.unquote(url) for url in source.url_links]
         upload_names = self._source_upload_names(source)
         self._log_info(
             "Source diagnostics: "
@@ -457,7 +453,9 @@ class Command(BaseCommand):
             file.filename or Path(file.file.name).name
             for file in source.uploaded_files.all()
         ]
-        url_text = " ".join(source.url or [])
+        url_text = " ".join(
+            u.get("link") if isinstance(u, dict) else str(u) for u in (source.url or [])
+        )
         corpus = " ".join(
             [
                 source.title or "",
@@ -599,11 +597,7 @@ class Command(BaseCommand):
             raise
 
     def _pick_source_url(self, source: DocumentSource) -> str | None:
-        urls = [
-            url.strip()
-            for url in (source.url or [])
-            if isinstance(url, str) and url.strip()
-        ]
+        urls = [url.strip() for url in source.url_links if url.strip()]
         if not urls:
             return None
 
@@ -715,7 +709,7 @@ class Command(BaseCommand):
             source.description or "",
             source.uploaded_filename or "",
         ]
-        snippets.extend(str(url) for url in (source.url or []) if isinstance(url, str))
+        snippets.extend(source.url_links)
         snippets.extend(self._source_upload_names(source))
 
         for snippet in snippets:
@@ -1120,11 +1114,7 @@ Press release markdown:
             f"description: {source.description or ''}",
             f"uploaded_filename: {source.uploaded_filename or ''}",
         ]
-        parts.extend(
-            f"url: {urllib.parse.unquote(url)}"
-            for url in (source.url or [])
-            if isinstance(url, str)
-        )
+        parts.extend(f"url: {urllib.parse.unquote(url)}" for url in source.url_links)
         parts.extend(
             f"uploaded_file: {name}" for name in self._source_upload_names(source)
         )

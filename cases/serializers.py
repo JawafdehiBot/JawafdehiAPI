@@ -275,7 +275,14 @@ class CaseDetailSerializer(CaseSerializer):
         if not raw_evidence:
             return []
 
-        source_ids = [e["source_id"] for e in raw_evidence if "source_id" in e]
+        def resolve_source_id(entry):
+            """Extract a string source_id from an entry, handling embedded dicts."""
+            sid = entry.get("source_id")
+            if isinstance(sid, dict):
+                return sid.get("source_id") or sid.get("link")
+            return sid
+
+        source_ids = [sid for e in raw_evidence if (sid := resolve_source_id(e))]
         sources = {
             s.source_id: DocumentSourceSerializer(s, context=self.context).data
             for s in DocumentSource.objects.filter(
@@ -288,10 +295,10 @@ class CaseDetailSerializer(CaseSerializer):
             | {
                 "source": (
                     {
-                        k: sources[entry["source_id"]][k]
-                        for k in ["title", "source_type", "url"]
+                        k: sources[sid][k]
+                        for k in ["title", "source_type", "url", "urls"]
                     }
-                    if entry.get("source_id") in sources
+                    if (sid := resolve_source_id(entry)) in sources
                     else None
                 )
             }
@@ -367,9 +374,18 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
     """
 
     url = serializers.SerializerMethodField(
+        help_text="Deprecated — use 'urls'. List of URL strings for this source, "
+        "including uploaded file URL when available"
+    )
+    urls = serializers.SerializerMethodField(
         help_text="List of URL dicts with 'link' and 'role' keys for this source, "
         "including uploaded file URL when available"
     )
+
+    @extend_schema_field(serializers.ListField(child=serializers.URLField()))
+    def get_url(self, obj):
+        """Backward-compat: return only link strings (deprecated)."""
+        return [u["link"] for u in self.get_urls(obj)]
 
     @extend_schema_field(
         inline_serializer(
@@ -383,7 +399,7 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
             },
         )
     )
-    def get_url(self, obj):
+    def get_urls(self, obj):
         request = self.context.get("request")
         merged_urls = []
         seen = set()
@@ -436,6 +452,7 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
             "description",
             "source_type",
             "url",
+            "urls",
             "publication_date",
             "created_at",
             "updated_at",

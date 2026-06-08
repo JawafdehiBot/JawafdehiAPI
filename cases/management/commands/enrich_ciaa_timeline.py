@@ -538,14 +538,13 @@ class Command(BaseCommand):
                 content_parts.append(description)
                 continue
 
-            if isinstance(source.url, list):
-                for url in source.url:
-                    parsed = urlparse(url)
-                    if parsed.hostname and parsed.hostname in ALLOWED_HOSTS:
-                        content = convert_to_markdown(url, session)
-                        if content and len(content) > 200:
-                            content_parts.append(content)
-                            break
+            for url in source.url_links:
+                parsed = urlparse(url)
+                if parsed.hostname and parsed.hostname in ALLOWED_HOSTS:
+                    content = convert_to_markdown(url, session)
+                    if content and len(content) > 200:
+                        content_parts.append(content)
+                        break
 
     # ── NGM structured hearing data ──────────────────────────────────────
 

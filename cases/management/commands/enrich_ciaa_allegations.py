@@ -940,9 +940,7 @@ class Command(BaseCommand):
             file.filename or Path(file.file.name).name
             for file in source.uploaded_files.all()
         ]
-        url_text = " ".join(
-            url for url in (source.url or []) if isinstance(url, str) and url.strip()
-        )
+        url_text = " ".join(source.url_links)
         corpus = " ".join(
             [
                 source.title or "",
@@ -1083,11 +1081,7 @@ class Command(BaseCommand):
         return urls[0] if urls else None
 
     def _ranked_source_urls(self, source: DocumentSource) -> list[str]:
-        urls = [
-            url.strip()
-            for url in (source.url or [])
-            if isinstance(url, str) and url.strip()
-        ]
+        urls = [url.strip() for url in source.url_links if url.strip()]
         if not urls:
             return []
 

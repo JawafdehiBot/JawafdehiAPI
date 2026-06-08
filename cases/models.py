@@ -869,6 +869,21 @@ class DocumentSource(models.Model):
     def __str__(self):
         return f"{self.source_id} - {self.title}"
 
+    @property
+    def url_links(self):
+        """Extract link strings from url field (handles both str and dict entries)."""
+        if not isinstance(self.url, list):
+            return []
+        result = []
+        for item in self.url:
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, dict):
+                link = item.get("link")
+                if link:
+                    result.append(link)
+        return result
+
     def clean(self):
         """
         Normalize and validate DocumentSource data.
@@ -882,11 +897,25 @@ class DocumentSource(models.Model):
         if not self.title:
             raise ValidationError({"title": "Title is required and cannot be empty"})
 
-        # Normalize URL list entries (strip whitespace from each URL)
+        # Normalize URL list entries (strip whitespace, normalize str→dict)
         if isinstance(self.url, list):
-            self.url = [
-                url.strip() if isinstance(url, str) else url for url in self.url
-            ]
+            normalized = []
+            for item in self.url:
+                if isinstance(item, str):
+                    stripped = item.strip()
+                    if stripped:
+                        normalized.append({"link": stripped, "role": None})
+                elif isinstance(item, dict):
+                    link = item.get("link", "")
+                    stripped = link.strip() if link else ""
+                    if stripped:
+                        entry = {"link": stripped}
+                        role = item.get("role")
+                        entry["role"] = role if role is not None else None
+                        normalized.append(entry)
+                else:
+                    normalized.append(item)
+            self.url = normalized
 
         # Enforce publication_date for media/news sources
         if self.source_type == SourceType.MEDIA_NEWS and not self.publication_date:
