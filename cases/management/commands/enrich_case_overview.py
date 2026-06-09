@@ -1833,7 +1833,7 @@ class Command(BaseCommand):
     def _generate_case_slug(self, case, title_text):
         current_slug = case.slug or ""
         broken_pattern = re.compile(
-            r"case-\d{3}-[cr]-\d{4}.*case-\d{3}|case-[0-9a-f]{12}-[0-9a-f]{6}"
+            r"case-\d{3}-cr-\d{4}.*case-\d{3}|case-[0-9a-f]{12}-[0-9a-f]{6}"
         )
         if current_slug and not broken_pattern.search(current_slug):
             logger.info(

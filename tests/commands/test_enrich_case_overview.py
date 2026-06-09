@@ -2040,17 +2040,15 @@ class TestAssembleAndSave:
         case = _make_case("case-save-002", title="Original")
         cmd = Command()
         cmd.stats = _make_stats()
-        with patch.object(Case.objects, "filter") as mock_filter:
-            mock_filter.return_value.first.return_value = None
-            cmd._assemble_and_save(
-                case,
-                "short",
-                "long desc",
-                "New Title",
-                "case-save-002-new",
-                dry_run=False,
-                force=False,
-            )
+        cmd._assemble_and_save(
+            case,
+            "short",
+            "long desc",
+            "New Title",
+            "case-save-002-new",
+            dry_run=False,
+            force=False,
+        )
         case.refresh_from_db()
         assert case.short_description == "short"
         assert case.title == "New Title"
