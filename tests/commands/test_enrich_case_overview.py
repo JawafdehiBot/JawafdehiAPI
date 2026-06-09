@@ -28,6 +28,7 @@ from django.core.management import CommandError, call_command
 from cases.management.commands.enrich_case_overview import (
     _CLOUD_METADATA_IP,
     CHUNK_SIZE,
+    SECTION_SPECS,
     Command,
     _confined_output_path,
     _copy_stream_to_path_with_limit,
@@ -41,6 +42,7 @@ from cases.management.commands.enrich_case_overview import (
     _SafeRedirectHandler,
     _sanitize_download_filename,
     _source_url_priority,
+    _url_stem,
     _validate_host_safety,
     chunk_document_text,
     normalize_base_url,
@@ -74,6 +76,21 @@ def _make_case(
         description=description or "",
         court_cases=court_cases,
     )
+
+
+def _make_stats():
+    return {
+        k: 0
+        for k in (
+            "cases_processed",
+            "cases_enriched",
+            "cases_skipped",
+            "cases_failed",
+            "cases_no_content",
+            "llm_extraction_failures",
+            "llm_formatting_failures",
+        )
+    }
 
 
 def _make_source(
@@ -1885,20 +1902,158 @@ class TestIsDirectDocumentUrl:
 
 
 class TestSourceUrlPriority:
-    def test_prioritizes_ngm_store(self):
+    def test_docx_highest_priority(self):
+        assert _source_url_priority("https://example.com/report.docx") == 4
+
+    def test_doc_second_highest(self):
+        assert _source_url_priority("https://example.com/report.doc") == 3
+
+    def test_pdf_lower_than_docx(self):
         assert _source_url_priority(
-            "https://ngm-store.jawafdehi.org/doc.pdf"
-        ) > _source_url_priority("https://other.com/doc.pdf")
+            "https://example.com/report.docx"
+        ) > _source_url_priority("https://example.com/report.pdf")
 
-    def test_prioritizes_pdf_over_docx(self):
-        a = _source_url_priority("https://example.com/doc.pdf")
-        b = _source_url_priority("https://example.com/doc.docx")
-        assert a >= b
+    def test_pdf_third(self):
+        assert _source_url_priority("https://example.com/report.pdf") == 2
 
-    def test_prioritizes_direct_doc_over_webpage(self):
-        a = _source_url_priority("https://example.com/doc.pdf")
-        b = _source_url_priority("https://example.com/page.html")
-        assert a > b
+    def test_webpage_lowest(self):
+        assert _source_url_priority("https://example.com/page.html") == 0
+
+    def test_docx_over_pdf_unrelated(self):
+        assert _source_url_priority(
+            "https://other.com/doc.docx"
+        ) > _source_url_priority("https://ngm-store.jawafdehi.org/doc.pdf")
+
+
+class TestUrlStem:
+    def test_stem_from_pdf(self):
+        assert _url_stem("https://example.com/docs/report.pdf") == "report"
+
+    def test_stem_from_docx(self):
+        assert _url_stem("https://example.com/docs/report.docx") == "report"
+
+    def test_stem_from_doc(self):
+        assert _url_stem("https://example.com/docs/report.doc") == "report"
+
+    def test_stem_with_path(self):
+        assert "report" in _url_stem("https://example.com/a/b/report.docx")
+
+
+class TestSectionSpecs:
+    def test_title_spec_has_required_keys(self):
+        spec = SECTION_SPECS["title"]
+        assert "max_tokens" in spec
+        assert "evidence_budget" in spec
+        assert spec["max_tokens"] == 80
+        assert spec["evidence_budget"] == 5000
+
+
+@pytest.mark.django_db
+class TestGenerateTitle:
+    def test_skips_when_title_already_short(self):
+        case = _make_case("case-gen-title-001", title="Existing short title")
+        cmd = Command()
+        result = cmd._generate_title(case, {}, "model", "base_url", "key", 30, True)
+        assert result is None
+
+    def test_generates_title_for_long_raw_title(self):
+        case = _make_case(
+            "case-gen-title-002",
+            title="A" * 150,
+        )
+        cmd = Command()
+        with patch.object(
+            cmd,
+            "_call_llm",
+            return_value="उपभोक्ता हितमा भ्रष्टाचार (case-gen-title-002)",
+        ):
+            result = cmd._generate_title(case, {}, "model", "base_url", "key", 30, True)
+        assert result is not None
+        assert len(result) <= 100
+        assert "case-gen-title-002" in result
+
+    def test_title_generation_failure_does_not_crash(self):
+        case = _make_case(
+            "case-gen-title-003",
+            title="B" * 150,
+        )
+        cmd = Command()
+        with patch.object(cmd, "_call_llm", return_value=""):
+            result = cmd._generate_title(case, {}, "model", "base_url", "key", 30, True)
+        assert result is None
+
+
+@pytest.mark.django_db
+class TestGenerateCaseSlug:
+    def test_generates_slug_from_title(self):
+        case = _make_case("case-080-cr-0007", title="भ्रष्टाचार मुद्दा")
+        case.slug = "case-080-cr-0007-broken-case-080-cr-0007"
+        case.save()
+        cmd = Command()
+        with patch.object(cmd, "_call_llm", return_value="bhrashtachar mudda"):
+            result = cmd._generate_case_slug(case, "भ्रष्टाचार मुद्दा")
+        assert result is not None
+        assert result.startswith("case-080-cr-0007-")
+
+    def test_generates_slug_fallback_when_keywords_empty(self):
+        case = _make_case("case-080-cr-0007", title="नेपाल मुद्दा")
+        case.slug = "case-080-cr-0007-broken-case-080-cr-0007"
+        case.save()
+        cmd = Command()
+        with patch.object(cmd, "_call_llm", return_value=""):
+            result = cmd._generate_case_slug(case, "नेपाल मुद्दा")
+        assert result is None
+
+    def test_skips_when_slug_already_clean(self):
+        case = _make_case("case-clean-001", title="Clean slug")
+        case.slug = "case-clean-001-nice-keywords"
+        case.save()
+        cmd = Command()
+        result = cmd._generate_case_slug(case, "Clean slug")
+        assert result is None
+
+    def test_replaces_broken_slug(self):
+        case = _make_case("case-123", title="ठूलो भ्रष्टाचार")
+        case.slug = "case-abc123def456-789abc"
+        case.save()
+        cmd = Command()
+        with patch.object(cmd, "_call_llm", return_value="thulo bhrashtachar"):
+            result = cmd._generate_case_slug(case, "ठूलो भ्रष्टाचार")
+        assert result is not None
+        assert result.startswith("case-123-")
+
+
+@pytest.mark.django_db
+class TestAssembleAndSave:
+    def test_dry_run_does_not_save(self):
+        case = _make_case("case-save-001", title="Dry run test")
+        cmd = Command()
+        cmd.stats = _make_stats()
+        with patch.object(Case.objects, "filter") as mock_filter:
+            mock_filter.return_value.first.return_value = None
+            cmd._assemble_and_save(
+                case, "short", "long desc", None, None, dry_run=True, force=False
+            )
+        assert cmd.stats["cases_enriched"] == 1
+
+    def test_saves_title_and_slug_when_provided(self):
+        case = _make_case("case-save-002", title="Original")
+        cmd = Command()
+        cmd.stats = _make_stats()
+        with patch.object(Case.objects, "filter") as mock_filter:
+            mock_filter.return_value.first.return_value = None
+            cmd._assemble_and_save(
+                case,
+                "short",
+                "long desc",
+                "New Title",
+                "case-save-002-new",
+                dry_run=False,
+                force=False,
+            )
+        case.refresh_from_db()
+        assert case.short_description == "short"
+        assert case.title == "New Title"
 
 
 class TestCopyStreamToPathWithLimit:

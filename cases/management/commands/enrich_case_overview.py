@@ -97,6 +97,13 @@ from cases.services.priority_case_loader import filter_by_priority, load_priorit
 
 logger = logging.getLogger(__name__)
 
+SECTION_SPECS = {
+    "title": {
+        "max_tokens": 80,
+        "evidence_budget": 5000,
+    },
+}
+
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 DOWNLOAD_CHUNK_SIZE = 16 * 1024
 DEFAULT_OPENCODE_BASE = "https://llm-proxy.jawafdehi.org/v1"
@@ -401,6 +408,23 @@ CRITICAL FORMATTING RULES:
   "(पाठ आंशिक रूपमा अस्पष्ट)" where data is uncertain.
 - Preserve ALL specific details from extracted data exactly.
 - Return ONLY {{"short_description": "...", "description": "..."}}."""
+
+
+TITLE_GENERATION_PROMPT = """\
+You are a Nepali legal writer for JAWAFDEHI. Generate a concise Nepali case title
+(max 100 characters) from the following case data.
+
+Extracted case data:
+{extracted_json}
+
+Format rules:
+- Max 100 characters total.
+- Format: either "{Location/Org}मा {corruption type} ({case_number})"
+  or "{Accused name/role}द्वारा {corruption type} ({case_number})".
+- Include the case number at the end in parentheses.
+- Write entirely in Nepali Devanagari except for the case number.
+- No markdown, no explanation, no quotes.
+- Return ONLY the title string."""
 
 
 def _validate_host_safety(hostname: str) -> None:
@@ -1409,7 +1433,7 @@ class Command(BaseCommand):
 
         if is_opencode:
             self.stdout.write(
-                f"  [1/2] Extracting structured data via map-reduce "
+                f"  [1/4] Extracting structured data via map-reduce "
                 f"(charge_sheet={len(source_texts['charge_sheet'])} chars, "
                 f"press_releases={sum(len(t) for t in source_texts['press_releases'])} chars, "
                 f"court_orders={sum(len(t) for t in source_texts['court_orders'])} chars)..."
@@ -1521,7 +1545,7 @@ class Command(BaseCommand):
             )
 
             self.stdout.write(
-                f"  [1/2] Extracting structured data "
+                f"  [1/4] Extracting structured data "
                 f"(charge_sheet={len(source_texts['charge_sheet'])} chars)..."
             )
             logger.info(
@@ -1642,7 +1666,7 @@ class Command(BaseCommand):
         )
 
         fmt_prompt = FORMATTING_USER_PROMPT.format(**fmt_context)
-        self.stdout.write("  [2/2] Formatting Markdown overview...")
+        self.stdout.write("  [2/4] Formatting Markdown overview...")
         logger.info("Case %s: step=format status=calling", case.case_id)
 
         # Format step with JSON-parse retry
@@ -1725,24 +1749,161 @@ class Command(BaseCommand):
             )
             return
 
+        # [3/4] Title generation (LLM, only if current title > 120 chars)
+        new_title = self._generate_title(
+            case, extracted_json, model, base_url, api_key, timeout, is_opencode
+        )
+        if new_title:
+            self.stdout.write(f"  [3/4] Generated title: {new_title[:80]}...")
+            logger.info(
+                "Case %s: step=title status=ok title_len=%d",
+                case.case_id,
+                len(new_title),
+            )
+        else:
+            self.stdout.write(
+                "  [3/4] Title unchanged (existing title ≤120 chars or generation failed)"
+            )
+
+        # [4/4] Slug generation (LLM, only if current slug is broken)
+        new_slug = self._generate_case_slug(case, new_title or case.title)
+        if new_slug:
+            self.stdout.write(f"  [4/4] Generated slug: {new_slug}")
+            logger.info(
+                "Case %s: step=slug status=ok slug=%s",
+                case.case_id,
+                new_slug,
+            )
+        else:
+            self.stdout.write(
+                "  [4/4] Slug unchanged (already clean or generation failed)"
+            )
+
+        self._assemble_and_save(
+            case=case,
+            short_description=short_description,
+            description=description,
+            new_title=new_title,
+            new_slug=new_slug,
+            dry_run=dry_run,
+            force=force,
+        )
+
+    # ── Title & slug generation ──────────────────────────────────────
+
+    def _generate_title(
+        self, case, extracted_json, model, base_url, api_key, timeout, is_opencode
+    ):
+        if case.title and len(case.title) <= 120:
+            logger.info(
+                "Case %s: step=title status=skip reason=already_short len=%d",
+                case.case_id,
+                len(case.title),
+            )
+            return None
+        prompt = TITLE_GENERATION_PROMPT.format(
+            extracted_json=json.dumps(extracted_json, ensure_ascii=False, indent=2),
+        )
+        raw = self._call_llm(
+            model,
+            base_url,
+            api_key,
+            timeout,
+            is_opencode,
+            None,  # no system prompt for title
+            prompt,
+            step_tag="title",
+        )
+        if not raw or not raw.strip():
+            logger.warning(
+                "Case %s: step=title status=failed reason=empty", case.case_id
+            )
+            return None
+        title = raw.strip().strip('"').strip("'").strip(".”").strip()
+        if len(title) > 100:
+            title = title[:100].rsplit(" ", 1)[0] if " " in title[:100] else title[:100]
+        logger.info(
+            "Case %s: step=title status=ok title=%s len=%d",
+            case.case_id,
+            title,
+            len(title),
+        )
+        return title
+
+    def _generate_case_slug(self, case, title_text):
+        current_slug = case.slug or ""
+        broken_pattern = re.compile(
+            r"case-\d{3}-[cr]-\d{4}.*case-\d{3}|case-[0-9a-f]{12}-[0-9a-f]{6}"
+        )
+        if current_slug and not broken_pattern.search(current_slug):
+            logger.info(
+                "Case %s: step=slug status=skip reason=already_clean slug=%s",
+                case.case_id,
+                current_slug,
+            )
+            return None
+        number = case.case_id.replace("case-", "") if case.case_id else ""
+        kw_prompt = f"""Extract 2-3 lowercase ASCII keywords (space-separated) from this Nepali case title for a URL slug: {title_text[:200]}
+Return ONLY space-separated keywords, no punctuation, no explanation."""
+
+        raw = self._call_llm(
+            "claude-sonnet-4-20250514",
+            "https://api.anthropic.com/v1",
+            os.environ.get("LLM_API_KEY", ""),
+            30,
+            False,  # is_opencode=False — direct Anthropic
+            None,
+            kw_prompt,
+            step_tag="slug",
+        )
+        if not raw or not raw.strip():
+            logger.warning(
+                "Case %s: step=slug status=failed reason=empty_keywords", case.case_id
+            )
+            return None
+        keywords = re.sub(r"[^a-z0-9\s-]", "", raw.strip().lower()).strip()
+        keywords = " ".join(keywords.split()[:3])
+        if not keywords:
+            return None
+        candidate = f"case-{number}-{keywords}" if number else f"case-{keywords}"
+        # Add hash if collision with existing slugs
+        if Case.objects.filter(slug=candidate).exclude(pk=case.pk).exists():
+            suffix = hashlib.md5(candidate.encode()).hexdigest()[:6]
+            candidate = f"{candidate}-{suffix}"
+        logger.info(
+            "Case %s: step=slug status=ok slug=%s",
+            case.case_id,
+            candidate,
+        )
+        return candidate
+
+    def _assemble_and_save(
+        self, case, short_description, description, new_title, new_slug, dry_run, force
+    ):
         if dry_run:
             self.stats["cases_enriched"] += 1
             logger.info(
-                "Case %s: step=save status=dry_run description=%d",
+                "Case %s: step=save status=dry_run description=%d title=%s slug=%s",
                 case.case_id,
                 len(description),
+                new_title,
+                new_slug,
             )
             self.stdout.write(
                 self.style.SUCCESS(
                     f"  [DRY RUN] Would save overview ({len(description)} chars)"
+                    + (f", title={new_title}" if new_title else "")
+                    + (f", slug={new_slug}" if new_slug else "")
                 )
             )
             return
 
+        update_fields = []
+
         case.short_description = short_description
+        update_fields.append("short_description")
+
         if not force:
-            # Re-read description from DB — it may have been populated by another
-            # process during the LLM call window (30-60+ s). Skip overwrite if so.
             fresh = (
                 Case.objects.filter(pk=case.pk)
                 .values_list("description", flat=True)
@@ -1764,17 +1925,33 @@ class Command(BaseCommand):
                 return
         if not case.description or force:
             case.description = description
+            update_fields.append("description")
 
-        case.save(update_fields=["short_description", "description", "updated_at"])
+        if new_title:
+            case.title = new_title
+            update_fields.append("title")
+        if new_slug:
+            case.slug = new_slug
+            update_fields.append("slug")
+
+        update_fields.append("updated_at")
+        case.save(update_fields=update_fields)
         self.stats["cases_enriched"] += 1
         logger.info(
-            "Case %s: step=save status=ok short_description=%d description=%d",
+            "Case %s: step=save status=ok short_description=%d description=%d title=%s slug=%s fields=%s",
             case.case_id,
             len(short_description),
             len(description),
+            new_title,
+            new_slug,
+            update_fields,
         )
         self.stdout.write(
-            self.style.SUCCESS(f"  ENRICHED: Saved overview ({len(description)} chars)")
+            self.style.SUCCESS(
+                f"  ENRICHED: Saved overview ({len(description)} chars)"
+                + (f", title={new_title[:60]}" if new_title else "")
+                + (f", slug={new_slug}" if new_slug else "")
+            )
         )
 
     # ── LLM calls ──────────────────────────────────────────────────
@@ -2127,6 +2304,18 @@ class Command(BaseCommand):
         direct = [url for url in urls if _is_direct_document_url(url)]
         other = [url for url in urls if url not in direct]
         direct.sort(key=_source_url_priority, reverse=True)
+        # Dedup same-stem PDFs when DOC/DOCX already covers that document
+        seen_stems = {
+            _url_stem(u)
+            for u in direct
+            if _url_stem(u) and _source_url_priority(u) >= 3  # DOCX/DOC
+        }
+        if seen_stems:
+            direct = [
+                u
+                for u in direct
+                if _source_url_priority(u) >= 3 or _url_stem(u) not in seen_stems
+            ]
         return direct + other
 
     # ── Validation ─────────────────────────────────────────────────
@@ -2464,10 +2653,19 @@ def _is_direct_document_url(url):
 
 
 def _source_url_priority(url):
-    parsed = urllib.parse.urlparse(url)
-    path = urllib.parse.unquote(parsed.path).lower()
-    return (
-        int(parsed.netloc.lower() == "ngm-store.jawafdehi.org"),
-        int(path.endswith(".pdf")),
-        int(path.endswith((".pdf", ".doc", ".docx"))),
-    )
+    path = urllib.parse.unquote(urllib.parse.urlparse(url).path).lower()
+    if path.endswith(".docx"):
+        return 4
+    if path.endswith(".doc"):
+        return 3
+    return 2 if path.endswith(".pdf") else 0
+
+
+def _url_stem(url):
+    path = urllib.parse.unquote(urllib.parse.urlparse(url).path).lower()
+    stem = path.rstrip("/").split("/")[-1] if "/" in path else path
+    for ext in (".docx", ".doc", ".pdf"):
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    return stem
