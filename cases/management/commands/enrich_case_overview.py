@@ -419,8 +419,8 @@ Extracted case data:
 
 Format rules:
 - Max 100 characters total.
-- Format: either "{Location/Org}मा {corruption type} ({case_number})"
-  or "{Accused name/role}द्वारा {corruption type} ({case_number})".
+- Format: either "{{Location/Org}}मा {{corruption type}} ({{case_number}})"
+  or "{{Accused name/role}}द्वारा {{corruption type}} ({{case_number}})".
 - Include the case number at the end in parentheses.
 - Write entirely in Nepali Devanagari except for the case number.
 - No markdown, no explanation, no quotes.
