@@ -357,7 +357,7 @@ class TestSanitizeDownloadFilename:
 
     def test_handles_path_traversal(self):
         result = _sanitize_download_filename("../../../etc/passwd", "src-001")
-        assert "etc" not in result.lower() or "passwd" not in result
+        assert "etc" not in result.lower()
 
     def test_handles_null_bytes(self):
         result = _sanitize_download_filename("file\x00name.pdf", "src-001")
@@ -1993,7 +1993,7 @@ class TestGenerateCaseSlug:
         with patch.object(cmd, "_call_llm", return_value="bhrashtachar mudda"):
             result = cmd._generate_case_slug(case, "भ्रष्टाचार मुद्दा")
         assert result is not None
-        assert result.startswith("case-080-cr-0007-")
+        assert result == "case-080-cr-0007-bhrashtachar-mudda"
 
     def test_generates_slug_fallback_when_keywords_empty(self):
         case = _make_case("case-080-cr-0007", title="नेपाल मुद्दा")
@@ -2030,7 +2030,7 @@ class TestAssembleAndSave:
         cmd = Command()
         cmd.stats = _make_stats()
         with patch.object(Case.objects, "filter") as mock_filter:
-            mock_filter.return_value.first.return_value = None
+            mock_filter.return_value.values_list.return_value.first.return_value = None
             cmd._assemble_and_save(
                 case, "short", "long desc", None, None, dry_run=True, force=False
             )

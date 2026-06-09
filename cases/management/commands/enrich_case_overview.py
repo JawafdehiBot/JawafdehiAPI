@@ -1862,7 +1862,7 @@ Return ONLY space-separated keywords, no punctuation, no explanation."""
             )
             return None
         keywords = re.sub(r"[^a-z0-9\s-]", "", raw.strip().lower()).strip()
-        keywords = " ".join(keywords.split()[:3])
+        keywords = "-".join(keywords.split()[:3])
         if not keywords:
             return None
         candidate = f"case-{number}-{keywords}" if number else f"case-{keywords}"
