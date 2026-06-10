@@ -164,9 +164,10 @@ class CaseImporter:
             else:
                 # SQLite fallback: fetch all non-deleted sources and check URLs in Python
                 for url in url_list:
-                    for source in DocumentSource.objects.filter(is_deleted=False).only(
-                        "source_id", "title", "url"
-                    ):
+                    candidates = DocumentSource.objects.filter(
+                        url__icontains=url, is_deleted=False
+                    ).only("source_id", "title", "url")
+                    for source in candidates:
                         if isinstance(source.url, list):
                             for stored in source.url:
                                 stored_link = (

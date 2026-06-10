@@ -361,7 +361,7 @@ class SourceLinkField(serializers.Field):
         if isinstance(value, dict):
             return {
                 "link": value.get("link"),
-                "role": value.get("role") or SourceLinkRole.RAW.value,
+                "role": value.get("role") or None,
             }
         return value
 
@@ -410,9 +410,8 @@ class DocumentSourceSerializer(serializers.ModelSerializer):
             candidate = value
             if request is not None:
                 candidate = request.build_absolute_uri(candidate)
-            dedupe_key = (candidate, role)
-            if dedupe_key not in seen:
-                seen.add(dedupe_key)
+            if candidate not in seen:
+                seen.add(candidate)
                 merged_urls.append({"link": candidate, "role": role})
 
         for item in list(obj.url or []):

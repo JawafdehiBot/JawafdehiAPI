@@ -47,7 +47,8 @@ def reverse_url_dicts_to_strs(apps, schema_editor):
     """
     Convert dict entries back to plain strings (for rollback).
 
-    Each ``{link, role}`` dict becomes just the ``link`` string value.
+    NOTE: This is a lossy reversal — all role assignments (RAW, MARKDOWN, PERMALINK)
+    are discarded. Only the link string value is preserved.
     """
     DocumentSource = apps.get_model("cases", "DocumentSource")
     db_alias = schema_editor.connection.alias

@@ -532,10 +532,15 @@ class Command(BaseCommand):
             needs_update = any(file_url not in existing_links for file_url in file_urls)
 
             if needs_update:
-                # Build complete URL list from existing link strings
-                # (existing.url has dicts, url_links gives plain strings for dedup)
-                existing_links = existing.url_links
-                url_list = [{"link": link, "role": None} for link in existing_links]
+                # Build complete URL list from existing link dicts, preserving existing roles
+                url_list = [
+                    (
+                        {"link": item.get("link"), "role": item.get("role")}
+                        if isinstance(item, dict)
+                        else {"link": item, "role": None}
+                    )
+                    for item in (existing.url or [])
+                ]
 
                 # Encode and add press release web URL first (ensure it's at the beginning)
                 if press_release_url and str(press_release_url).strip():
