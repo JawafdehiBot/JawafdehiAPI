@@ -120,6 +120,9 @@ _MAP_REDUCE_CONCURRENCY = 3  # max concurrent async chunk extractions
 DEVANAGARI_ALPHABETIC_RE = re.compile(r"[ऄ-हक़-ॡ]")
 ALPHABETIC_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 _LLM_PROMPT_SIZE_WARN = 60000
+_UNSET = "(unset)"  # placeholder for env-var logging
+_SECTION_SEP = "\n\n---\n\n"  # separator between doc sections in prompts
+_DOC_EXTENSIONS = (".pdf", ".doc", ".docx")  # document file extensions
 _CLOUD_METADATA_IP = "169.254.169.254"  # NOSONAR — cloud metadata link-local
 _SSRF_BLOCKED_HOSTNAMES = frozenset(
     {"localhost", "metadata.google.internal", _CLOUD_METADATA_IP, "metadata", "0.0.0.0"}
@@ -724,9 +727,9 @@ class Command(BaseCommand):
             model,
             base_url,
             is_opencode,
-            os.environ.get("JAWAFDEHI_ALLEGATION_MODEL", "(unset)"),
-            os.environ.get("JAWAFDEHI_LLM_MODEL", "(unset)"),
-            os.environ.get("JAWAFDEHI_LLM_PROXY_URL", "(unset)"),
+            os.environ.get("JAWAFDEHI_ALLEGATION_MODEL", _UNSET),
+            os.environ.get("JAWAFDEHI_LLM_MODEL", _UNSET),
+            os.environ.get("JAWAFDEHI_LLM_PROXY_URL", _UNSET),
             options.get("llm_model") or "(default)",
             options.get("llm_base_url") or "(default)",
         )
@@ -1234,7 +1237,7 @@ class Command(BaseCommand):
         model: str,
         base_url: str,
         api_key: str,
-        timeout: int,
+        request_timeout: int,
     ) -> dict:
         """Extract structured data from a single chunk via AsyncOpenAI.
 
@@ -1247,7 +1250,7 @@ class Command(BaseCommand):
             chunk_text=chunk_text,
         )
         client = AsyncOpenAI(
-            api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0
+            api_key=api_key, base_url=base_url, timeout=request_timeout, max_retries=0
         )
         for attempt in range(1, 4):
             try:
@@ -1452,7 +1455,7 @@ class Command(BaseCommand):
             except ExtractionFailed as exc:
                 self.stats["llm_extraction_failures"] += 1
                 self.stats["cases_failed"] += 1
-                logger.error(
+                logger.exception(
                     "Case %s: step=extract status=failed reason=chunk_fatal %s",
                     case.case_id,
                     exc,
@@ -1477,7 +1480,7 @@ class Command(BaseCommand):
         else:
             # Anthropic fallback: truncate at prompt assembly time
             press_text = (
-                "\n\n---\n\n".join(
+                _SECTION_SEP.join(
                     f"Press Release {i+1}:\n{t}"
                     for i, t in enumerate(source_texts["press_releases"])
                 )
@@ -1490,7 +1493,7 @@ class Command(BaseCommand):
             court_total = 0
             for i, t in enumerate(truncated_orders):
                 header = f"Court Order {i+1}:\n"
-                sep = "\n\n---\n\n" if court_joined else ""
+                sep = _SECTION_SEP if court_joined else ""
                 chunk = sep + header + t
                 if court_total + len(chunk) > 15000:
                     break
@@ -1499,7 +1502,7 @@ class Command(BaseCommand):
             court_text = court_joined if court_joined else "(No court orders available)"
 
             investigative_text = (
-                "\n\n---\n\n".join(
+                _SECTION_SEP.join(
                     f"Investigative Report {i+1}:\n{t}"
                     for i, t in enumerate(source_texts["investigative_reports"])
                 )
@@ -1508,7 +1511,7 @@ class Command(BaseCommand):
             )
 
             financial_text = (
-                "\n\n---\n\n".join(
+                _SECTION_SEP.join(
                     f"Financial Document {i+1}:\n{t}"
                     for i, t in enumerate(source_texts["financial_docs"])
                 )
@@ -1657,7 +1660,7 @@ class Command(BaseCommand):
         # formatter can reference them alongside already-converted sources.
         court_order_texts = discovery.get("court_order_texts", [])
         fmt_context["court_order_discovery_texts"] = (
-            "\n\n---\n\n".join(
+            _SECTION_SEP.join(
                 f"Discovered Court Order {i+1}:\n{t[:8000]}"
                 for i, t in enumerate(court_order_texts)
             )
@@ -1868,7 +1871,9 @@ Return ONLY space-separated keywords, no punctuation, no explanation."""
         candidate = f"case-{number}-{keywords}" if number else f"case-{keywords}"
         # Add hash if collision with existing slugs
         if Case.objects.filter(slug=candidate).exclude(pk=case.pk).exists():
-            suffix = hashlib.md5(candidate.encode()).hexdigest()[:6]
+            suffix = hashlib.md5(candidate.encode(), usedforsecurity=False).hexdigest()[
+                :6
+            ]
             candidate = f"{candidate}-{suffix}"
         logger.info(
             "Case %s: step=slug status=ok slug=%s",
@@ -2649,7 +2654,7 @@ def _has_ngm_store_url(source) -> bool:
 
 def _is_direct_document_url(url):
     path = urllib.parse.unquote(urllib.parse.urlparse(url).path).lower()
-    return path.endswith((".pdf", ".doc", ".docx"))
+    return path.endswith(_DOC_EXTENSIONS)
 
 
 def _source_url_priority(url):

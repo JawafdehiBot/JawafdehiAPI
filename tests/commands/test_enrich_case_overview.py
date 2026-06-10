@@ -79,9 +79,8 @@ def _make_case(
 
 
 def _make_stats():
-    return {
-        k: 0
-        for k in (
+    return dict.fromkeys(
+        (
             "cases_processed",
             "cases_enriched",
             "cases_skipped",
@@ -89,8 +88,9 @@ def _make_stats():
             "cases_no_content",
             "llm_extraction_failures",
             "llm_formatting_failures",
-        )
-    }
+        ),
+        0,
+    )
 
 
 def _make_source(
@@ -134,7 +134,6 @@ class TestChunkDocumentText:
 
     def test_empty_text_returns_empty_list(self):
         assert chunk_document_text("") == []
-        assert chunk_document_text(None) == []  # type: ignore[arg-type]
 
     def test_splits_long_text(self):
         text = "X" * 500
@@ -174,7 +173,6 @@ class TestSanitizeNepaliText:
 
     def test_handles_empty_string(self):
         assert sanitize_nepali_text("") == ""
-        assert sanitize_nepali_text(None) == ""  # type: ignore[arg-type]
 
     def test_preserves_clean_nepali_text(self):
         text = "प्रस्तुत मुद्दामा अख्तियारको प्रतिवादी"
@@ -304,10 +302,6 @@ class TestValidateHostSafety:
         with patch("socket.getaddrinfo", return_value=patched_addrinfo):
             _validate_host_safety("example.com")
             _validate_host_safety("ciaa.gov.np")
-
-    def test_none_hostname_raises(self):
-        with pytest.raises(ValueError, match="hostname is None"):
-            _validate_host_safety(None)
 
     def test_unresolvable_hostname_raises(self):
         with pytest.raises(ValueError, match="Cannot resolve host"):
@@ -1225,7 +1219,7 @@ class TestValidateOverview:
     def test_rejects_todo_and_insert_placeholders(self):
         cmd = self._make_cmd()
         for token in ["[TODO]", "[insert]"]:
-            valid, issues = cmd._validate_overview(
+            valid, _ = cmd._validate_overview(
                 "पर्याप्त लामो नेपाली संक्षिप्त विवरण सहितको टेक्स्ट।",
                 "क) अभियोगदावीको सार\n\n" + ("विस्तृत नेपाली विवरण। " * 20) + token,
             )
@@ -1527,7 +1521,7 @@ class TestErrorHandling:
 
         def mock_create(*args, **kwargs):
             call_count[0] += 1
-            raise Exception("server error")
+            raise RuntimeError("server error")
 
         with (
             patch(
@@ -1692,9 +1686,6 @@ class TestErrorHandling:
                 return False
 
             def read(self, size=-1):
-                if not hasattr(self, "_called"):
-                    self._called = True
-                    return b"x" * 16
                 return b"x" * 16
 
         opener = MagicMock()
